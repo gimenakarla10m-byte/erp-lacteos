@@ -1,8 +1,9 @@
 """
 ERP de inventarios para planta de lácteos
 =========================================
-Módulos: catálogos, recepción de leche, producción (con suero y mermas),
-pedidos/despachos, Kardex transaccional, inventario físico e indicadores.
+Módulos: catálogos (productos, proveedores, operadores), recepción de leche,
+pasteurización, producción (con suero y mermas), pedidos/despachos, Kardex
+transaccional, inventario físico e indicadores.
 
 Requisitos:   pip install "streamlit>=1.50" pandas
 Ejecución:    streamlit run erp_lacteos.py
@@ -20,6 +21,8 @@ import streamlit as st
 DB = "erp_lacteos.db"
 
 TIPOS_PRODUCTO = ["Materia prima", "Insumo", "Producto terminado", "Subproducto"]
+UNIDADES = ["kg", "L", "empaque", "unidad"]
+VERSION_CATALOGO = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS productos (
@@ -35,6 +38,28 @@ CREATE TABLE IF NOT EXISTS proveedores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nombre TEXT NOT NULL,
     ruta TEXT
+);
+CREATE TABLE IF NOT EXISTS operadores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nombre TEXT NOT NULL,
+    cargo TEXT,
+    activo INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS meta (
+    clave TEXT PRIMARY KEY,
+    valor TEXT
+);
+CREATE TABLE IF NOT EXISTS pasteurizacion (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fecha TEXT NOT NULL,
+    lote TEXT NOT NULL,
+    litros REAL NOT NULL,
+    temperatura REAL NOT NULL,
+    tiempo_min REAL NOT NULL,
+    hora_inicio TEXT,
+    operador_id INTEGER NOT NULL REFERENCES operadores(id),
+    conforme INTEGER NOT NULL,
+    observacion TEXT
 );
 CREATE TABLE IF NOT EXISTS movimientos (          -- KARDEX
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +88,8 @@ CREATE TABLE IF NOT EXISTS produccion (
     cantidad_obtenida REAL NOT NULL,
     suero_obtenido REAL DEFAULT 0,
     suero_vendido REAL DEFAULT 0,
-    suero_usado REAL DEFAULT 0
+    suero_usado REAL DEFAULT 0,
+    operador_id INTEGER REFERENCES operadores(id)
 );
 CREATE TABLE IF NOT EXISTS pedidos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,15 +111,38 @@ CREATE TABLE IF NOT EXISTS conteos (
 """
 
 SEED_PRODUCTOS = [
-    ("MP-LECHE", "Leche cruda", "Materia prima", "L", 500),
-    ("IN-CUAJO", "Cuajo", "Insumo", "kg", 2),
-    ("IN-SAL", "Sal", "Insumo", "kg", 20),
-    ("IN-CULT", "Cultivo lácteo", "Insumo", "kg", 1),
-    ("PT-MOZ", "Queso mozzarella", "Producto terminado", "kg", 30),
-    ("PT-MANT", "Queso mantecoso", "Producto terminado", "kg", 30),
-    ("PT-RIC", "Ricotta", "Producto terminado", "kg", 10),
-    ("PT-YOG", "Yogurt", "Producto terminado", "L", 50),
-    ("PT-MANTEQ", "Mantequilla", "Producto terminado", "kg", 10),
+    # Materias primas e insumos
+    ("MP-LECHE", "Leche cruda", "Materia prima", "L", 0),
+    ("MP-CUAJO", "Cuajo", "Materia prima", "kg", 0),
+    ("IN-SAL", "Sal", "Insumo", "kg", 0),
+    ("IN-CULT", "Cultivo lácteo", "Insumo", "empaque", 0),
+    # Productos terminados (25)
+    ("PT-MOZ", "Mozzarella", "Producto terminado", "kg", 0),
+    ("PT-MANT", "Mantecoso", "Producto terminado", "kg", 0),
+    ("PT-MANTEQ", "Mantequilla", "Producto terminado", "kg", 0),
+    ("PT-QFRESCO", "Queso fresco", "Producto terminado", "kg", 0),
+    ("PT-QUESILLO", "Quesillo", "Producto terminado", "kg", 0),
+    ("PT-PARMESANO", "Parmesano", "Producto terminado", "kg", 0),
+    ("PT-EDAM", "Edam", "Producto terminado", "kg", 0),
+    ("PT-ANDINO", "Andino", "Producto terminado", "kg", 0),
+    ("PT-PARIA", "Paria", "Producto terminado", "kg", 0),
+    ("PT-SUIZO", "Suizo", "Producto terminado", "kg", 0),
+    ("PT-PECANAS", "Pecanas", "Producto terminado", "kg", 0),
+    ("PT-GOUDA", "Gouda", "Producto terminado", "kg", 0),
+    ("PT-OREGANO", "Orégano", "Producto terminado", "kg", 0),
+    ("PT-FINASHIERBAS", "Finas hierbas", "Producto terminado", "kg", 0),
+    ("PT-DAMBO", "Dambo", "Producto terminado", "kg", 0),
+    ("PT-ACEITUNA", "Aceituna", "Producto terminado", "kg", 0),
+    ("PT-BABYSUIZO", "Baby suizo", "Producto terminado", "kg", 0),
+    ("PT-TILSIT", "Tilsit", "Producto terminado", "kg", 0),
+    ("PT-YOG", "Yogurt", "Producto terminado", "L", 0),
+    ("PT-NATILLA", "Natilla", "Producto terminado", "kg", 0),
+    ("PT-MANJAR", "Manjar", "Producto terminado", "kg", 0),
+    ("PT-RIC", "Ricota", "Producto terminado", "kg", 0),
+    ("PT-PROVOLONE", "Provolone", "Producto terminado", "kg", 0),
+    ("PT-MERMELADA", "Mermelada", "Producto terminado", "kg", 0),
+    ("PT-ROCOTO", "Queso con rocoto", "Producto terminado", "kg", 0),
+    # Subproducto
     ("SB-SUERO", "Suero de leche", "Subproducto", "L", 0),
 ]
 
@@ -114,13 +163,43 @@ def q(sql, params=()):
         con.close()
 
 
+def get_meta(con, clave, default=None):
+    row = con.execute("SELECT valor FROM meta WHERE clave=?", (clave,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(con, clave, valor):
+    con.execute("INSERT INTO meta (clave, valor) VALUES (?,?) "
+                "ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor", (clave, str(valor)))
+
+
+def migrar(con):
+    """Actualiza bases de datos creadas con versiones anteriores del ERP (una sola vez)."""
+    cols = [r[1] for r in con.execute("PRAGMA table_info(produccion)")]
+    if "operador_id" not in cols:
+        con.execute("ALTER TABLE produccion ADD COLUMN operador_id INTEGER REFERENCES operadores(id)")
+    if int(get_meta(con, "catalogo_version", 0)) < VERSION_CATALOGO:
+        con.execute("UPDATE productos SET codigo='MP-CUAJO', tipo='Materia prima' WHERE codigo='IN-CUAJO'")
+        con.execute("UPDATE productos SET unidad='empaque' WHERE codigo='IN-CULT'")
+        for cod, nom in [("PT-MOZ", "Mozzarella"), ("PT-MANT", "Mantecoso"), ("PT-RIC", "Ricota")]:
+            con.execute("UPDATE productos SET nombre=? WHERE codigo=?", (nom, cod))
+        # los mínimos de la versión anterior eran de ejemplo: se dejan en 0 (sin alerta)
+        con.execute("UPDATE productos SET stock_minimo=0 WHERE codigo IN "
+                    "('MP-LECHE','MP-CUAJO','IN-SAL','IN-CULT','PT-MOZ','PT-MANT','PT-MANTEQ',"
+                    "'PT-RIC','PT-YOG','SB-SUERO')")
+        con.executemany(
+            "INSERT OR IGNORE INTO productos (codigo, nombre, tipo, unidad, stock_minimo) "
+            "VALUES (?,?,?,?,?)", SEED_PRODUCTOS)
+        set_meta(con, "catalogo_version", VERSION_CATALOGO)
+    if get_meta(con, "past_temp_min") is None:
+        set_meta(con, "past_temp_min", 63)      # °C  (ajustable en el módulo Pasteurización)
+        set_meta(con, "past_tiempo_min", 30)    # minutos
+
+
 def init_db():
     con = get_conn()
     con.executescript(SCHEMA)
-    if con.execute("SELECT COUNT(*) FROM productos").fetchone()[0] == 0:
-        con.executemany(
-            "INSERT INTO productos (codigo, nombre, tipo, unidad, stock_minimo) "
-            "VALUES (?,?,?,?,?)", SEED_PRODUCTOS)
+    migrar(con)
     con.commit()
     con.close()
 
@@ -180,17 +259,21 @@ def registrar_recepcion(fecha, proveedor_id, litros, grasa, acidez, densidad, te
     transaccion(_op)
 
 
-def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s_usado):
+def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s_usado,
+                         operador_id=None):
+    if obtenida <= 0:
+        raise ValueError("La cantidad obtenida debe ser mayor que cero.")
     if s_vendido + s_usado > suero + 1e-9:
         raise ValueError("Suero vendido + usado no puede superar el suero obtenido.")
 
     def _op(con):
         con.execute(
             "INSERT INTO produccion (fecha, lote, producto_id, litros_leche, cantidad_obtenida, "
-            "suero_obtenido, suero_vendido, suero_usado) VALUES (?,?,?,?,?,?,?,?)",
-            (str(fecha), lote, pid, litros, obtenida, suero, s_vendido, s_usado))
+            "suero_obtenido, suero_vendido, suero_usado, operador_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(fecha), lote, pid, litros, obtenida, suero, s_vendido, s_usado, operador_id))
         leche, suero_id = producto_id(con, "MP-LECHE"), producto_id(con, "SB-SUERO")
-        mover(con, fecha, leche, "SALIDA", "Consumo en producción", litros, lote)
+        if litros > 0:  # productos sin leche (p. ej. mermelada) no descuentan leche
+            mover(con, fecha, leche, "SALIDA", "Consumo en producción", litros, lote)
         mover(con, fecha, pid, "ENTRADA", "Producción terminada", obtenida, lote)
         if suero > 0:
             mover(con, fecha, suero_id, "ENTRADA", "Suero de producción", suero, lote)
@@ -199,6 +282,41 @@ def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s
         if s_usado > 0:
             mover(con, fecha, suero_id, "SALIDA", "Uso interno de suero", s_usado, lote)
     transaccion(_op)
+
+
+def registrar_pasteurizacion(fecha, lote, litros, temperatura, tiempo_min, hora_inicio,
+                             operador_id, observacion=None):
+    """Registra una pasteurización y devuelve True si cumplió los parámetros vigentes."""
+    if litros <= 0:
+        raise ValueError("Los litros pasteurizados deben ser mayores que cero.")
+    if operador_id is None:
+        raise ValueError("Selecciona el operador responsable.")
+    resultado = {}
+
+    def _op(con):
+        t_min = float(get_meta(con, "past_temp_min", 63))
+        m_min = float(get_meta(con, "past_tiempo_min", 30))
+        conforme = temperatura >= t_min and tiempo_min >= m_min
+        con.execute(
+            "INSERT INTO pasteurizacion (fecha, lote, litros, temperatura, tiempo_min, hora_inicio, "
+            "operador_id, conforme, observacion) VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(fecha), lote, litros, temperatura, tiempo_min, hora_inicio, operador_id,
+             int(conforme), observacion))
+        resultado["conforme"] = conforme
+    transaccion(_op)
+    return resultado["conforme"]
+
+
+def actualizar_producto(pid, nombre, tipo, unidad, minimo):
+    if not nombre.strip():
+        raise ValueError("El nombre es obligatorio.")
+    con = get_conn()
+    try:
+        con.execute("UPDATE productos SET nombre=?, tipo=?, unidad=?, stock_minimo=? WHERE id=?",
+                    (nombre.strip(), tipo, unidad, minimo, pid))
+        con.commit()
+    finally:
+        con.close()
 
 
 def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento):
@@ -276,7 +394,7 @@ def indicadores(desde, hasta, docs_fisicos=0):
     pr = q("""SELECT p.nombre, SUM(litros_leche) leche, SUM(cantidad_obtenida) obtenido,
                      SUM(suero_obtenido) suero, SUM(suero_vendido) vendido, SUM(suero_usado) usado
               FROM produccion pr JOIN productos p ON p.id = pr.producto_id
-              WHERE fecha BETWEEN ? AND ? GROUP BY p.nombre""", (d, h))
+              WHERE fecha BETWEEN ? AND ? AND litros_leche > 0 GROUP BY p.nombre""", (d, h))
     if len(pr):
         pr["recuperacion_%"] = pr.obtenido / pr.leche * 100
         out["recuperacion_global"] = pr.obtenido.sum() / pr.leche.sum() * 100
@@ -285,6 +403,11 @@ def indicadores(desde, hasta, docs_fisicos=0):
     else:
         out["recuperacion_global"] = out["suero_merma_l"] = out["suero_merma_%"] = None
     out["detalle_produccion"] = pr
+
+    # 5) Pasteurizaciones conformes / pasteurizaciones realizadas
+    pa = q("SELECT conforme FROM pasteurizacion WHERE fecha BETWEEN ? AND ?", (d, h))
+    out["pasteurizacion_conforme"] = (pa.conforme.mean() * 100) if len(pa) else None
+    out["pasteurizaciones"] = len(pa)
     return out
 
 
@@ -306,6 +429,17 @@ def pick_proveedor():
     return st.selectbox("Proveedor", list(opts), format_func=opts.get)
 
 
+def pick_operador(label="Operador", obligatorio=True, key=None):
+    df = q("SELECT id, nombre FROM operadores WHERE activo=1 ORDER BY nombre")
+    if df.empty:
+        if obligatorio:
+            st.info("Registra primero a los operadores en «Catálogos» → «Operadores».")
+        return None
+    opts = dict(zip(df.id.tolist(), df.nombre.tolist()))
+    ids = list(opts) if obligatorio else [None] + list(opts)
+    return st.selectbox(label, ids, format_func=lambda i: opts.get(i, "(sin asignar)"), key=key)
+
+
 def guardar(fn, *args, ok="Registrado correctamente."):
     try:
         fn(*args)
@@ -317,28 +451,37 @@ def guardar(fn, *args, ok="Registrado correctamente."):
 def pag_dashboard():
     st.header("Panel de inventario")
     df = stock_actual()
-    df["estado"] = df.apply(
-        lambda r: "⚠️ Bajo mínimo" if r.stock < r.stock_minimo else "OK", axis=1)
+
+    def estado(r):
+        if r.stock_minimo <= 0:
+            return "—"
+        return "⚠️ Bajo mínimo" if r.stock < r.stock_minimo else "OK"
+
+    df["estado"] = df.apply(estado, axis=1)
+    bajos = int(((df.stock_minimo > 0) & (df.stock < df.stock_minimo)).sum())
     c1, c2, c3 = st.columns(3)
     c1.metric("Productos activos", len(df))
-    c2.metric("Bajo stock mínimo", int((df.stock < df.stock_minimo).sum()))
+    c2.metric("Bajo stock mínimo", bajos)
     c3.metric("Movimientos en Kardex", int(q("SELECT COUNT(*) n FROM movimientos").n[0]))
+    st.caption("El estado solo se calcula si el producto tiene un stock mínimo mayor que 0 "
+               "(se define en Catálogos → Productos → Editar).")
     st.dataframe(df[["codigo", "nombre", "tipo", "unidad", "stock", "stock_minimo", "estado"]],
                  width="stretch", hide_index=True)
 
 
 def pag_catalogos():
     st.header("Catálogos")
-    t1, t2 = st.tabs(["Productos", "Proveedores"])
+    t1, t2, t3 = st.tabs(["Productos", "Proveedores", "Operadores"])
     with t1:
+        st.subheader("Agregar producto")
         with st.form("f_prod", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
             cod = c1.text_input("Código")
             nom = c2.text_input("Nombre")
             tipo = c3.selectbox("Tipo", TIPOS_PRODUCTO)
             u1, u2 = st.columns(2)
-            uni = u1.selectbox("Unidad", ["kg", "L", "unidad"])
-            minimo = u2.number_input("Stock mínimo", min_value=0.0, step=1.0)
+            uni = u1.selectbox("Unidad", UNIDADES)
+            minimo = u2.number_input("Stock mínimo (0 = sin alerta)", min_value=0.0, step=1.0)
             if st.form_submit_button("Agregar producto"):
                 def _add():
                     if not cod.strip() or not nom.strip():
@@ -353,22 +496,59 @@ def pag_catalogos():
                     finally:
                         con.close()
                 guardar(_add)
-        st.dataframe(q("SELECT codigo, nombre, tipo, unidad, stock_minimo FROM productos"),
-                     width="stretch", hide_index=True)
+
+        st.subheader("Editar producto")
+        prods = q("SELECT id, codigo, nombre, tipo, unidad, stock_minimo FROM productos ORDER BY tipo, nombre")
+        opts = dict(zip(prods.id.tolist(), (prods.nombre + " · " + prods.codigo).tolist()))
+        sel = st.selectbox("Producto a editar", list(opts), format_func=opts.get)
+        r = prods[prods.id == sel].iloc[0]
+        with st.form("f_edit"):
+            e1, e2 = st.columns(2)
+            n_nom = e1.text_input("Nombre", r.nombre, key=f"ed_nom_{sel}")
+            n_tipo = e2.selectbox("Tipo", TIPOS_PRODUCTO, index=TIPOS_PRODUCTO.index(r.tipo),
+                                  key=f"ed_tipo_{sel}")
+            e3, e4 = st.columns(2)
+            unidades = UNIDADES if r.unidad in UNIDADES else UNIDADES + [r.unidad]
+            n_uni = e3.selectbox("Unidad", unidades, index=unidades.index(r.unidad), key=f"ed_uni_{sel}")
+            n_min = e4.number_input("Stock mínimo (0 = sin alerta)", min_value=0.0, step=1.0,
+                                    value=float(r.stock_minimo), key=f"ed_min_{sel}")
+            st.caption("Cambiar la unidad de un producto que ya tiene movimientos no convierte "
+                       "las cantidades anteriores.")
+            if st.form_submit_button("Guardar cambios"):
+                guardar(actualizar_producto, sel, n_nom, n_tipo, n_uni, n_min, ok="Producto actualizado.")
+        st.subheader("Lista de productos")
+        st.dataframe(q("SELECT codigo, nombre, tipo, unidad, stock_minimo FROM productos "
+                       "ORDER BY tipo, nombre"), width="stretch", hide_index=True)
     with t2:
         with st.form("f_prov", clear_on_submit=True):
             n = st.text_input("Nombre del proveedor / ganadero")
-            r = st.text_input("Ruta de acopio")
+            r_ = st.text_input("Ruta de acopio")
             if st.form_submit_button("Agregar proveedor"):
                 def _addp():
                     if not n.strip():
                         raise ValueError("El nombre es obligatorio.")
                     con = get_conn()
-                    con.execute("INSERT INTO proveedores (nombre, ruta) VALUES (?,?)", (n.strip(), r.strip()))
+                    con.execute("INSERT INTO proveedores (nombre, ruta) VALUES (?,?)", (n.strip(), r_.strip()))
                     con.commit()
                     con.close()
                 guardar(_addp)
         st.dataframe(q("SELECT nombre, ruta FROM proveedores"), width="stretch", hide_index=True)
+    with t3:
+        with st.form("f_oper", clear_on_submit=True):
+            o1, o2 = st.columns(2)
+            on = o1.text_input("Nombre del operador")
+            oc = o2.text_input("Cargo (ej. Operador de pasteurización)")
+            if st.form_submit_button("Agregar operador"):
+                def _addo():
+                    if not on.strip():
+                        raise ValueError("El nombre es obligatorio.")
+                    con = get_conn()
+                    con.execute("INSERT INTO operadores (nombre, cargo) VALUES (?,?)", (on.strip(), oc.strip()))
+                    con.commit()
+                    con.close()
+                guardar(_addo)
+        st.dataframe(q("SELECT nombre, cargo FROM operadores WHERE activo=1 ORDER BY nombre"),
+                     width="stretch", hide_index=True)
 
 
 def pag_recepcion():
@@ -392,6 +572,62 @@ def pag_recepcion():
                  width="stretch", hide_index=True)
 
 
+def pag_pasteurizacion():
+    st.header("Pasteurización")
+    con = get_conn()
+    t_min = float(get_meta(con, "past_temp_min", 63))
+    m_min = float(get_meta(con, "past_tiempo_min", 30))
+    con.close()
+
+    with st.expander(f"Parámetros de conformidad (actual: ≥ {t_min:g} °C durante ≥ {m_min:g} min)"):
+        with st.form("f_past_par"):
+            p1, p2 = st.columns(2)
+            nt = p1.number_input("Temperatura mínima (°C)", min_value=0.0, value=t_min, step=0.5)
+            nm = p2.number_input("Tiempo mínimo de retención (min)", min_value=0.0, value=m_min, step=1.0)
+            if st.form_submit_button("Guardar parámetros"):
+                def _par():
+                    c = get_conn()
+                    set_meta(c, "past_temp_min", nt)
+                    set_meta(c, "past_tiempo_min", nm)
+                    c.commit()
+                    c.close()
+                guardar(_par, ok="Parámetros actualizados.")
+
+    st.subheader("Registrar pasteurización")
+    with st.form("f_past", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        f = c1.date_input("Fecha", date.today())
+        lote = c2.text_input("Lote / tanque")
+        hora = c3.time_input("Hora de inicio")
+        c4, c5, c6 = st.columns(3)
+        litros = c4.number_input("Litros pasteurizados", min_value=0.0, step=10.0)
+        temp = c5.number_input("Temperatura alcanzada (°C)", min_value=0.0, step=0.5)
+        tiempo = c6.number_input("Tiempo de retención (min)", min_value=0.0, step=1.0)
+        oper = pick_operador("Operador responsable", obligatorio=True)
+        obs = st.text_input("Observaciones (opcional)")
+        if st.form_submit_button("Registrar pasteurización"):
+            if not lote.strip():
+                st.error("El lote es obligatorio.")
+            else:
+                try:
+                    ok = registrar_pasteurizacion(f, lote.strip(), litros, temp, tiempo,
+                                                  hora.strftime("%H:%M"), oper, obs.strip() or None)
+                    if ok:
+                        st.success("Registrado: pasteurización CONFORME.")
+                    else:
+                        st.warning("Registrado, pero NO CONFORME: no alcanzó la temperatura o el "
+                                   "tiempo mínimos. Avisa al encargado de planta.")
+                except (ValueError, sqlite3.Error) as e:
+                    st.error(str(e))
+    df = q("""SELECT ps.fecha, ps.hora_inicio, ps.lote, ps.litros, ps.temperatura,
+                     ps.tiempo_min AS "tiempo_min", o.nombre AS operador,
+                     CASE ps.conforme WHEN 1 THEN 'Conforme' ELSE 'NO conforme' END AS resultado,
+                     ps.observacion
+              FROM pasteurizacion ps JOIN operadores o ON o.id = ps.operador_id
+              ORDER BY ps.fecha DESC, ps.id DESC""")
+    st.dataframe(df, width="stretch", hide_index=True)
+
+
 def pag_produccion():
     st.header("Producción y mermas")
     with st.form("f_prod_reg", clear_on_submit=True):
@@ -399,8 +635,10 @@ def pag_produccion():
         f = c1.date_input("Fecha", date.today())
         lote = c2.text_input("Lote")
         pid = pick_producto("Producto elaborado", ["Producto terminado"])
+        oper = pick_operador("Operador (opcional)", obligatorio=False)
         c3, c4 = st.columns(2)
-        litros = c3.number_input("Litros de leche usados", min_value=0.0, step=10.0)
+        litros = c3.number_input("Litros de leche usados (0 si el producto no lleva leche)",
+                                 min_value=0.0, step=10.0)
         obtenida = c4.number_input("Cantidad obtenida (kg o L)", min_value=0.0, step=1.0)
         st.caption("Suero: recibido → vendido / usado → la diferencia es la merma.")
         s1, s2, s3 = st.columns(3)
@@ -411,12 +649,15 @@ def pag_produccion():
             if not lote.strip():
                 st.error("El lote es obligatorio.")
             else:
-                guardar(registrar_produccion, f, lote.strip(), pid, litros, obtenida, suero, vendido, usado)
-    df = q("""SELECT pr.fecha, pr.lote, p.nombre AS producto, pr.litros_leche, pr.cantidad_obtenida,
+                guardar(registrar_produccion, f, lote.strip(), pid, litros, obtenida, suero,
+                        vendido, usado, oper)
+    df = q("""SELECT pr.fecha, pr.lote, p.nombre AS producto, o.nombre AS operador,
+                     pr.litros_leche, pr.cantidad_obtenida,
                      ROUND(pr.cantidad_obtenida * 100.0 / pr.litros_leche, 2) AS "recuperación_%",
                      pr.suero_obtenido, pr.suero_vendido, pr.suero_usado,
                      pr.suero_obtenido - pr.suero_vendido - pr.suero_usado AS merma_suero_L
               FROM produccion pr JOIN productos p ON p.id = pr.producto_id
+              LEFT JOIN operadores o ON o.id = pr.operador_id
               ORDER BY pr.fecha DESC, pr.id DESC""")
     st.dataframe(df, width="stretch", hide_index=True)
 
@@ -487,8 +728,11 @@ def pag_indicadores():
     m2.metric("Exactitud del inventario (meta ≥95%)", fmt(r["exactitud"]))
     m3.metric("Fill rate (meta ≥80%)", fmt(r["fill_rate"]))
     m4.metric("Recuperación de leche", fmt(r["recuperacion_global"]))
+    n1, n2 = st.columns(2)
     if r["suero_merma_l"] is not None:
-        st.metric("Merma de suero (L)", f"{r['suero_merma_l']:.1f}  ({fmt(r['suero_merma_%'])})")
+        n1.metric("Merma de suero (L)", f"{r['suero_merma_l']:.1f}  ({fmt(r['suero_merma_%'])})")
+    n2.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']} en el periodo)",
+              fmt(r["pasteurizacion_conforme"]))
     if len(r["detalle_produccion"]):
         st.subheader("Recuperación por producto")
         st.dataframe(r["detalle_produccion"], width="stretch", hide_index=True)
@@ -498,6 +742,7 @@ PAGINAS = {
     "Panel": pag_dashboard,
     "Catálogos": pag_catalogos,
     "Recepción de leche": pag_recepcion,
+    "Pasteurización": pag_pasteurizacion,
     "Producción y mermas": pag_produccion,
     "Pedidos y despachos": pag_despachos,
     "Kardex": pag_kardex,
