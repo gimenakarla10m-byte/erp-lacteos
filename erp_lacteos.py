@@ -33,6 +33,8 @@ MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO
          "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
 VERSION_CATALOGO = 2
 INSUMOS_PROCESO = ["Cloruro de calcio", "Cultivo", "Conservante", "Cuajo"]  # cuadro de insumos del control de proceso
+TIENDAS_INICIALES = ["Tienda principal", "Tienda en Baños", "Tienda de la Plaza de Armas",
+                     "Tienda de San Martín"]
 RESULTADO_MASTITIS = ["Negativo", "Positivo"]
 RESULTADO_ANTIBIOTICOS = ["Ausente", "Presente"]
 
@@ -291,6 +293,11 @@ def migrar(con):
             "INSERT OR IGNORE INTO productos (codigo, nombre, tipo, unidad, stock_minimo) "
             "VALUES (?,?,?,?,?)", SEED_PRODUCTOS)
         set_meta(con, "catalogo_version", VERSION_CATALOGO)
+    if get_meta(con, "destinos_iniciales") is None:  # se cargan una sola vez; después se administran en Catálogos
+        for nombre in TIENDAS_INICIALES:
+            if not con.execute("SELECT 1 FROM destinos WHERE nombre = ? COLLATE NOCASE", (nombre,)).fetchone():
+                con.execute("INSERT INTO destinos (nombre, tipo) VALUES (?, 'Tienda')", (nombre,))
+        set_meta(con, "destinos_iniciales", 1)
     if get_meta(con, "past_temp_min") is None:
         set_meta(con, "past_temp_min", 63)      # °C  (ajustable en el módulo Pasteurización)
         set_meta(con, "past_tiempo_min", 30)    # minutos
