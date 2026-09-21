@@ -3,7 +3,8 @@ ERP de inventarios para planta de lácteos
 =========================================
 Módulos: catálogos (productos, proveedores, operadores), recepción de leche,
 pasteurización, producción (con suero y mermas), pedidos/despachos, pedidos devueltos,
-almacén de producto terminado, resumen por semana/mes/año, Kardex
+almacén de producto terminado, programación diaria, trazabilidad por lote,
+destinos (tiendas), resumen por semana/mes/año, Kardex
 transaccional, inventario físico e indicadores.
 
 Requisitos:   pip install "streamlit>=1.50" pandas
@@ -31,6 +32,9 @@ DESTINO_MERMA = "Merma (ya no se puede vender)"
 MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO",
          "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
 VERSION_CATALOGO = 2
+INSUMOS_PROCESO = ["Cloruro de calcio", "Cultivo", "Conservante", "Cuajo"]  # cuadro de insumos del control de proceso
+RESULTADO_MASTITIS = ["Negativo", "Positivo"]
+RESULTADO_ANTIBIOTICOS = ["Ausente", "Presente"]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS productos (
@@ -118,6 +122,48 @@ CREATE TABLE IF NOT EXISTS devoluciones (
     destino TEXT NOT NULL,
     despacho_id INTEGER REFERENCES pedidos(id),
     documento TEXT,
+    observacion TEXT,
+    anulado INTEGER NOT NULL DEFAULT 0,
+    motivo_anulacion TEXT
+);
+CREATE TABLE IF NOT EXISTS destinos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nombre TEXT NOT NULL,
+    tipo TEXT NOT NULL DEFAULT 'Tienda',
+    activo INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS programacion (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fecha TEXT NOT NULL,
+    producto_id INTEGER NOT NULL REFERENCES productos(id),
+    litros_programados REAL NOT NULL,
+    responsable_id INTEGER REFERENCES operadores(id),
+    observacion TEXT,
+    anulado INTEGER NOT NULL DEFAULT 0,
+    motivo_anulacion TEXT
+);
+CREATE TABLE IF NOT EXISTS produccion_insumos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    produccion_id INTEGER NOT NULL REFERENCES produccion(id),
+    insumo TEXT NOT NULL,
+    cantidad_g REAL,
+    marca TEXT,
+    lote TEXT,
+    fecha_prod TEXT,
+    fecha_venc TEXT
+);
+CREATE TABLE IF NOT EXISTS trazabilidad (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    produccion_id INTEGER REFERENCES produccion(id),
+    lote TEXT,
+    producto_id INTEGER NOT NULL REFERENCES productos(id),
+    responsable_id INTEGER REFERENCES operadores(id),
+    fecha_produccion TEXT NOT NULL,
+    fecha_empaque TEXT,
+    fecha_envasado TEXT,
+    fecha_maduracion TEXT,
+    fecha_salida TEXT,
+    destino_id INTEGER REFERENCES destinos(id),
     observacion TEXT,
     anulado INTEGER NOT NULL DEFAULT 0,
     motivo_anulacion TEXT
@@ -215,6 +261,23 @@ def migrar(con):
         cols_t = [r[1] for r in con.execute(f"PRAGMA table_info({tabla})")]
         if col not in cols_t:
             con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+    nuevas = [  # columnas agregadas en esta versión
+        ("recepcion_leche", "hora", "TEXT"), ("recepcion_leche", "n_tanques", "INTEGER"),
+        ("recepcion_leche", "n_porongos", "INTEGER"), ("recepcion_leche", "procedencia", "TEXT"),
+        ("recepcion_leche", "ph", "REAL"), ("recepcion_leche", "lactosa", "REAL"),
+        ("recepcion_leche", "proteina", "REAL"), ("recepcion_leche", "sng", "REAL"),
+        ("recepcion_leche", "mastitis", "TEXT"), ("recepcion_leche", "antibioticos", "TEXT"),
+        ("recepcion_leche", "agua_l", "REAL"), ("recepcion_leche", "litros_aceptados", "REAL"),
+        ("recepcion_leche", "responsable_id", "INTEGER REFERENCES operadores(id)"),
+        ("pasteurizacion", "producto_id", "INTEGER REFERENCES productos(id)"),
+        ("pedidos", "destino_id", "INTEGER REFERENCES destinos(id)"),
+        ("pedidos", "responsable_envio_id", "INTEGER REFERENCES operadores(id)"),
+        ("devoluciones", "destino_id", "INTEGER REFERENCES destinos(id)"),
+        ("devoluciones", "responsable_id", "INTEGER REFERENCES operadores(id)"),
+    ]
+    for tabla, col, definicion in nuevas:
+        if col not in [r[1] for r in con.execute(f"PRAGMA table_info({tabla})")]:
+            con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {definicion}")
     if int(get_meta(con, "catalogo_version", 0)) < VERSION_CATALOGO:
         con.execute("UPDATE productos SET codigo='MP-CUAJO', tipo='Materia prima' WHERE codigo='IN-CUAJO'")
         con.execute("UPDATE productos SET unidad='empaque' WHERE codigo='IN-CULT'")
@@ -284,23 +347,47 @@ def transaccion(fn):
 
 
 # ── Operaciones de negocio ──
-def registrar_recepcion(fecha, proveedor_id, litros, grasa, acidez, densidad, temp, aprobada):
+def registrar_recepcion(fecha, proveedor_id, litros, grasa, acidez, densidad, temp, aprobada, *,
+                        hora=None, n_tanques=0, n_porongos=0, procedencia=None, ph=None, lactosa=None,
+                        proteina=None, sng=None, mastitis=None, antibioticos=None, agua_l=0.0,
+                        aceptada=None, responsable_id=None):
+    """Registra la llegada y el análisis de la leche. Al inventario entra solo la leche ACEPTADA."""
     if litros <= 0:
         raise ValueError("Los litros recibidos deben ser mayores que cero.")
+    agua_l = agua_l or 0.0
+    if agua_l < 0 or agua_l > litros + 1e-9:
+        raise ValueError("El agua detectada no puede ser negativa ni mayor que los litros recibidos.")
+    if aprobada and antibioticos == "Presente":
+        raise ValueError("Leche con residuos de antibióticos no debe aprobarse: "
+                         "desmarca «Aprobada» o corrige el análisis.")
+    if aprobada:
+        acept = aceptada if aceptada and aceptada > 0 else litros - agua_l
+        if acept <= 0:
+            raise ValueError("No queda leche aceptada para ingresar al inventario.")
+        if acept > litros + 1e-9:
+            raise ValueError("La leche aceptada no puede ser mayor que la recibida.")
+    else:
+        acept = 0.0
 
     def _op(con):
         con.execute(
             "INSERT INTO recepcion_leche (fecha, proveedor_id, litros, grasa, acidez, densidad, "
-            "temperatura, aprobada) VALUES (?,?,?,?,?,?,?,?)",
-            (str(fecha), proveedor_id, litros, grasa, acidez, densidad, temp, int(aprobada)))
+            "temperatura, aprobada, hora, n_tanques, n_porongos, procedencia, ph, lactosa, proteina, sng, "
+            "mastitis, antibioticos, agua_l, litros_aceptados, responsable_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(fecha), proveedor_id, litros, grasa, acidez, densidad, temp, int(aprobada), hora,
+             n_tanques, n_porongos, procedencia, ph, lactosa, proteina, sng, mastitis, antibioticos,
+             agua_l, acept, responsable_id))
         if aprobada:  # la leche rechazada no ingresa al inventario
             mover(con, fecha, producto_id(con, "MP-LECHE"), "ENTRADA",
-                  "Recepción de leche", litros, documento=f"REC-{fecha}")
+                  "Recepción de leche", acept, documento=f"REC-{fecha}")
     transaccion(_op)
 
 
 def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s_usado,
-                         operador_id=None):
+                         operador_id=None, insumos=None):
+    """Registra la producción. También abre su registro de trazabilidad y guarda los insumos usados
+    (los insumos se registran solo como dato del lote: su almacén no forma parte del ERP)."""
     if obtenida <= 0:
         raise ValueError("La cantidad obtenida debe ser mayor que cero.")
     if s_vendido + s_usado > suero + 1e-9:
@@ -312,6 +399,17 @@ def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s
             "suero_obtenido, suero_vendido, suero_usado, operador_id, merma_en_kardex) "
             "VALUES (?,?,?,?,?,?,?,?,?,1)",
             (str(fecha), lote, pid, litros, obtenida, suero, s_vendido, s_usado, operador_id))
+        prod_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        con.execute("INSERT INTO trazabilidad (produccion_id, lote, producto_id, responsable_id, "
+                    "fecha_produccion) VALUES (?,?,?,?,?)", (prod_id, lote, pid, operador_id, str(fecha)))
+        for it in (insumos or []):
+            if it.get("cantidad_g") or (it.get("marca") or "").strip() or (it.get("lote") or "").strip():
+                con.execute(
+                    "INSERT INTO produccion_insumos (produccion_id, insumo, cantidad_g, marca, lote, "
+                    "fecha_prod, fecha_venc) VALUES (?,?,?,?,?,?,?)",
+                    (prod_id, it["insumo"], it.get("cantidad_g") or None, (it.get("marca") or "").strip() or None,
+                     (it.get("lote") or "").strip() or None, (it.get("fecha_prod") or "").strip() or None,
+                     (it.get("fecha_venc") or "").strip() or None))
         leche, suero_id = producto_id(con, "MP-LECHE"), producto_id(con, "SB-SUERO")
         if litros > 0:  # productos sin leche (p. ej. mermelada) no descuentan leche
             mover(con, fecha, leche, "SALIDA", "Consumo en producción", litros, lote)
@@ -329,7 +427,7 @@ def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s
 
 
 def registrar_pasteurizacion(fecha, lote, litros, temperatura, tiempo_min, hora_inicio,
-                             operador_id, observacion=None):
+                             operador_id, observacion=None, producto_id_=None):
     """Registra una pasteurización y devuelve True si cumplió los parámetros vigentes."""
     if litros <= 0:
         raise ValueError("Los litros pasteurizados deben ser mayores que cero.")
@@ -343,9 +441,9 @@ def registrar_pasteurizacion(fecha, lote, litros, temperatura, tiempo_min, hora_
         conforme = temperatura >= t_min and tiempo_min >= m_min
         con.execute(
             "INSERT INTO pasteurizacion (fecha, lote, litros, temperatura, tiempo_min, hora_inicio, "
-            "operador_id, conforme, observacion) VALUES (?,?,?,?,?,?,?,?,?)",
+            "operador_id, conforme, observacion, producto_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (str(fecha), lote, litros, temperatura, tiempo_min, hora_inicio, operador_id,
-             int(conforme), observacion))
+             int(conforme), observacion, producto_id_))
         resultado["conforme"] = conforme
     transaccion(_op)
     return resultado["conforme"]
@@ -376,7 +474,8 @@ def anular_recepcion(rid, motivo):
     def _op(con):
         _marcar_anulado(con, "recepcion_leche", rid, motivo)
         litros, aprobada = con.execute(
-            "SELECT litros, aprobada FROM recepcion_leche WHERE id=?", (rid,)).fetchone()
+            "SELECT COALESCE(litros_aceptados, litros), aprobada FROM recepcion_leche WHERE id=?",
+            (rid,)).fetchone()
         if aprobada and litros > 0:
             mover(con, date.today(), producto_id(con, "MP-LECHE"), "SALIDA",
                   "Anulación de recepción", litros, f"ANUL-REC-{rid}", motivo)
@@ -386,6 +485,8 @@ def anular_recepcion(rid, motivo):
 def anular_produccion(rid, motivo):
     def _op(con):
         _marcar_anulado(con, "produccion", rid, motivo)
+        con.execute("UPDATE trazabilidad SET anulado=1, motivo_anulacion=? WHERE produccion_id=?",
+                    (motivo, rid))
         pid, litros, obtenida, suero, vendido, usado, con_merma = con.execute(
             "SELECT producto_id, litros_leche, cantidad_obtenida, suero_obtenido, suero_vendido, "
             "suero_usado, merma_en_kardex FROM produccion WHERE id=?", (rid,)).fetchone()
@@ -445,6 +546,57 @@ def anular_conteo(rid, motivo):
 
 def anular_pasteurizacion(rid, motivo):
     transaccion(lambda con: _marcar_anulado(con, "pasteurizacion", rid, motivo))
+
+
+def registrar_programacion(fecha, pid, litros, responsable_id=None, observacion=None):
+    if litros <= 0:
+        raise ValueError("Los litros programados deben ser mayores que cero.")
+    transaccion(lambda con: con.execute(
+        "INSERT INTO programacion (fecha, producto_id, litros_programados, responsable_id, observacion) "
+        "VALUES (?,?,?,?,?)", (str(fecha), pid, litros, responsable_id, observacion)))
+
+
+def anular_programacion(rid, motivo):
+    transaccion(lambda con: _marcar_anulado(con, "programacion", rid, motivo))
+
+
+def actualizar_trazabilidad(rid, fecha_empaque=None, fecha_envasado=None, fecha_maduracion=None,
+                            fecha_salida=None, destino_id=None, observacion=None):
+    """Completa las etapas de un lote a medida que ocurren; lo que va vacío no se toca."""
+    campos = {"fecha_empaque": fecha_empaque, "fecha_envasado": fecha_envasado,
+              "fecha_maduracion": fecha_maduracion, "fecha_salida": fecha_salida,
+              "destino_id": destino_id, "observacion": observacion}
+    campos = {k: (str(v) if k.startswith("fecha") else v) for k, v in campos.items() if v not in (None, "")}
+    if not campos:
+        raise ValueError("No llenaste ninguna fecha ni el destino.")
+
+    def _op(con):
+        fila = con.execute("SELECT fecha_produccion, anulado FROM trazabilidad WHERE id=?", (rid,)).fetchone()
+        if fila is None or fila[1]:
+            raise ValueError("Ese registro no existe o está anulado.")
+        for k, v in campos.items():
+            if k.startswith("fecha") and v < fila[0]:
+                raise ValueError("Ninguna etapa puede tener fecha anterior a la de producción "
+                                 f"({fila[0]}).")
+        sets = ", ".join(f"{k}=?" for k in campos)
+        con.execute(f"UPDATE trazabilidad SET {sets} WHERE id=?", (*campos.values(), rid))
+    transaccion(_op)
+
+
+def dar_de_baja_destino(did):
+    transaccion(lambda con: con.execute("UPDATE destinos SET activo=0 WHERE id=?", (did,)))
+
+
+def reactivar_destino(did):
+    transaccion(lambda con: con.execute("UPDATE destinos SET activo=1 WHERE id=?", (did,)))
+
+
+def eliminar_destino(did):
+    try:
+        transaccion(lambda con: con.execute("DELETE FROM destinos WHERE id=?", (did,)))
+    except sqlite3.IntegrityError:
+        raise ValueError("Ese destino ya tiene despachos, devoluciones o trazabilidad registrados, "
+                         "así que no se puede eliminar. Usa «Dar de baja».") from None
 
 
 def dar_de_baja_producto(pid):
@@ -543,34 +695,50 @@ def actualizar_producto(pid, nombre, tipo, unidad, minimo):
         con.close()
 
 
-def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento):
+def _nombre_destino(con, destino_id):
+    fila = con.execute("SELECT nombre FROM destinos WHERE id=?", (destino_id,)).fetchone()
+    if fila is None:
+        raise ValueError("El destino elegido no existe.")
+    return fila[0]
+
+
+def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento, destino_id=None,
+                       responsable_id=None):
     if despachada > pedida:
         raise ValueError("No se puede despachar más de lo pedido.")
+    if destino_id is None and not (cliente or "").strip():
+        raise ValueError("Elige la tienda de destino o escribe el cliente.")
 
     def _op(con):
+        cli = _nombre_destino(con, destino_id) if destino_id is not None else cliente
         con.execute(
-            "INSERT INTO pedidos (fecha, cliente, producto_id, cant_pedida, cant_despachada, documento) "
-            "VALUES (?,?,?,?,?,?)", (str(fecha), cliente, pid, pedida, despachada, documento))
+            "INSERT INTO pedidos (fecha, cliente, producto_id, cant_pedida, cant_despachada, documento, "
+            "destino_id, responsable_envio_id) VALUES (?,?,?,?,?,?,?,?)",
+            (str(fecha), cli, pid, pedida, despachada, documento, destino_id, responsable_id))
         if despachada > 0:
-            mover(con, fecha, pid, "SALIDA", "Despacho a cliente", despachada, documento, cliente)
+            mover(con, fecha, pid, "SALIDA", "Despacho a cliente", despachada, documento, cli)
     transaccion(_op)
 
 
 def registrar_devolucion(fecha, cliente, pid, cantidad, motivo, destino, despacho_id=None,
-                         documento=None, observacion=None):
+                         documento=None, observacion=None, destino_id=None, responsable_id=None):
     if cantidad <= 0:
         raise ValueError("La cantidad devuelta debe ser mayor que cero.")
-    if despacho_id is None and not (cliente or "").strip():
-        raise ValueError("Indica el cliente o elige el despacho de origen.")
+    if despacho_id is None and destino_id is None and not (cliente or "").strip():
+        raise ValueError("Indica la tienda o el cliente, o elige el despacho de origen.")
 
     def _op(con):
         cli, prod = cliente, pid
+        dest_id = destino_id
+        if despacho_id is None and destino_id is not None:
+            cli = _nombre_destino(con, destino_id)
         if despacho_id is not None:
             fila = con.execute("SELECT cliente, producto_id, cant_despachada, anulado "
                                "FROM pedidos WHERE id=?", (despacho_id,)).fetchone()
             if fila is None or fila[3]:
                 raise ValueError("El despacho elegido no existe o está anulado.")
             cli, prod, despachada = fila[0], fila[1], fila[2]
+            dest_id = con.execute("SELECT destino_id FROM pedidos WHERE id=?", (despacho_id,)).fetchone()[0]
             ya = con.execute("SELECT COALESCE(SUM(cantidad), 0) FROM devoluciones "
                              "WHERE despacho_id=? AND anulado=0", (despacho_id,)).fetchone()[0]
             if cantidad + ya > despachada + 1e-9:
@@ -578,8 +746,10 @@ def registrar_devolucion(fecha, cliente, pid, cantidad, motivo, destino, despach
                                  f"no se pueden devolver {cantidad:g} más.")
         con.execute(
             "INSERT INTO devoluciones (fecha, cliente, producto_id, cantidad, motivo, destino, "
-            "despacho_id, documento, observacion) VALUES (?,?,?,?,?,?,?,?,?)",
-            (str(fecha), cli, prod, cantidad, motivo, destino, despacho_id, documento, observacion))
+            "despacho_id, documento, observacion, destino_id, responsable_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (str(fecha), cli, prod, cantidad, motivo, destino, despacho_id, documento, observacion,
+             dest_id, responsable_id))
         if destino == DESTINO_REINGRESO:
             mover(con, fecha, prod, "ENTRADA", "Devolución de cliente", cantidad, documento, cli)
     transaccion(_op)
@@ -703,12 +873,35 @@ def pick_operador(label="Operador", obligatorio=True, key=None):
     return st.selectbox(label, ids, format_func=lambda i: opts.get(i, "(sin asignar)"), key=key)
 
 
+def pick_producto_opcional(label, tipos=None, key=None):
+    df = stock_actual()
+    if tipos:
+        df = df[df.tipo.isin(tipos)]
+    opts = dict(zip(df.id.tolist(), (df.nombre + " (" + df.unidad + ")").tolist()))
+    return st.selectbox(label, [None] + list(opts), format_func=lambda i: opts.get(i, "(sin especificar)"),
+                        key=key)
+
+
+def pick_destino(label="Tienda de destino", opcional=True, key=None):
+    df = q("SELECT id, nombre FROM destinos WHERE activo=1 ORDER BY nombre")
+    opts = dict(zip(df.id.tolist(), df.nombre.tolist()))
+    ids = ([None] if opcional else []) + list(opts)
+    if not ids:
+        st.info("Registra primero las tiendas en «Catálogos» → «Destinos (tiendas)».")
+        return None
+    return st.selectbox(label, ids, format_func=lambda i: opts.get(i, "(otro cliente / no es tienda)"),
+                        key=key)
+
+
 def guardar(fn, *args, ok="Registrado correctamente."):
+    """Ejecuta la operación y muestra el resultado. Devuelve True si se guardó."""
     try:
         fn(*args)
         st.success(ok)
+        return True
     except (ValueError, sqlite3.Error) as e:
         st.error(str(e))
+        return False
 
 
 def pag_dashboard():
@@ -734,7 +927,7 @@ def pag_dashboard():
 
 def pag_catalogos():
     st.header("Catálogos")
-    t1, t2, t3 = st.tabs(["Productos", "Proveedores", "Operadores"])
+    t1, t2, t3, t4 = st.tabs(["Productos", "Proveedores", "Operadores", "Destinos (tiendas)"])
     with t1:
         st.subheader("Agregar producto")
         with st.form("f_prod", clear_on_submit=True):
@@ -919,6 +1112,66 @@ def pag_catalogos():
                         guardar(reactivar_operador, sel_ro, ok="Operador reactivado.")
         ops = q(sql_ops.format(activo=1))   # se vuelve a consultar para mostrar la lista actualizada
         st.dataframe(ops.drop(columns="id"), width="stretch", hide_index=True)
+    with t4:
+        bloque_destinos()
+
+def bloque_destinos():
+    with st.form("f_dest", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        nombre = c1.text_input("Nombre de la tienda o destino")
+        tipo = c2.selectbox("Tipo", ["Tienda", "Otro"])
+        if st.form_submit_button("Agregar destino"):
+            def _add():
+                if not nombre.strip():
+                    raise ValueError("El nombre es obligatorio.")
+                transaccion(lambda con: con.execute("INSERT INTO destinos (nombre, tipo) VALUES (?,?)",
+                                                    (nombre.strip(), tipo)))
+            guardar(_add)
+
+    sql = """SELECT d.id, d.nombre, d.tipo,
+                    (SELECT COUNT(*) FROM pedidos p WHERE p.destino_id = d.id) +
+                    (SELECT COUNT(*) FROM devoluciones v WHERE v.destino_id = d.id) +
+                    (SELECT COUNT(*) FROM trazabilidad t WHERE t.destino_id = d.id) AS registros
+             FROM destinos d WHERE d.activo = {activo} ORDER BY d.nombre"""
+
+    def etiquetas(df):
+        return dict(zip(df.id.tolist(), (df.nombre + " · " + df.tipo + " · " +
+                                         df.registros.astype(str) + " registros").tolist()))
+
+    activos = q(sql.format(activo=1))
+    if not activos.empty:
+        with st.expander("Dar de baja un destino (ya no se usa)"):
+            st.caption("Deja de aparecer al registrar, pero su historial se conserva.")
+            opts = etiquetas(activos)
+            with st.form("f_baja_dest"):
+                sel_b = st.selectbox("Destino", list(opts), format_func=opts.get)
+                ok_b = st.checkbox("Confirmo que quiero darlo de baja", key="ok_baja_dest")
+                if st.form_submit_button("Dar de baja el destino"):
+                    if not ok_b:
+                        st.error("Marca la casilla de confirmación.")
+                    else:
+                        guardar(dar_de_baja_destino, sel_b, ok="Destino dado de baja (su historial se conserva).")
+        with st.expander("Eliminar definitivamente (solo si se registró por error)"):
+            st.caption("Solo se puede eliminar si no tiene registros.")
+            opts = etiquetas(activos)
+            with st.form("f_del_dest"):
+                sel_e = st.selectbox("Destino a eliminar", list(opts), format_func=opts.get)
+                ok_e = st.checkbox("Confirmo que quiero eliminarlo", key="ok_del_dest")
+                if st.form_submit_button("Eliminar destino"):
+                    if not ok_e:
+                        st.error("Marca la casilla de confirmación.")
+                    else:
+                        guardar(eliminar_destino, sel_e, ok="Destino eliminado.")
+    inactivos = q(sql.format(activo=0))
+    if not inactivos.empty:
+        with st.expander("Destinos dados de baja (reactivar)"):
+            opts = etiquetas(inactivos)
+            with st.form("f_react_dest"):
+                sel_r = st.selectbox("Destino", list(opts), format_func=opts.get)
+                if st.form_submit_button("Reactivar destino"):
+                    guardar(reactivar_destino, sel_r, ok="Destino reactivado.")
+    st.dataframe(q(sql.format(activo=1)).drop(columns="id"), width="stretch", hide_index=True)
+
 
 def form_anular(key, vigentes, fn):
     """Formulario genérico para anular un registro (corregir un error) sin borrar el historial."""
@@ -942,31 +1195,65 @@ def form_anular(key, vigentes, fn):
 
 
 def pag_recepcion():
-    st.header("Recepción de leche")
+    st.header("Llegada y análisis de leche")
     with st.form("f_rec", clear_on_submit=True):
         prov = pick_proveedor()
-        f = st.date_input("Fecha", date.today())
-        litros = st.number_input("Litros recibidos", min_value=0.0, step=10.0)
-        c1, c2, c3, c4 = st.columns(4)
-        grasa = c1.number_input("Grasa (%)", min_value=0.0, step=0.1)
-        acidez = c2.number_input("Acidez (°D)", min_value=0.0, step=0.5)
-        dens = c3.number_input("Densidad", min_value=0.0, step=0.001, format="%.3f")
-        temp = c4.number_input("Temp. (°C)", min_value=0.0, step=0.5)
+        c1, c2, c3 = st.columns(3)
+        f = c1.date_input("Fecha", date.today())
+        hora = c2.time_input("Hora de llegada", value=None)
+        proced = c3.text_input("Lugar de procedencia")
+        c4, c5, c6 = st.columns(3)
+        litros = c4.number_input("Litros recibidos", min_value=0.0, step=10.0)
+        tanques = c5.number_input("N.º de tanques", min_value=0, step=1)
+        porongos = c6.number_input("N.º de porongos", min_value=0, step=1)
+        st.markdown("**Análisis de la materia prima**")
+        a1, a2, a3, a4 = st.columns(4)
+        grasa = a1.number_input("Grasa (%)", min_value=0.0, step=0.1)
+        acidez = a2.number_input("Acidez (°D)", min_value=0.0, step=0.5)
+        dens = a3.number_input("Densidad", min_value=0.0, step=0.001, format="%.3f")
+        temp = a4.number_input("Temp. (°C)", min_value=0.0, step=0.5)
+        b1, b2, b3, b4 = st.columns(4)
+        ph = b1.number_input("pH", min_value=0.0, step=0.1)
+        lactosa = b2.number_input("Lactosa (%)", min_value=0.0, step=0.1)
+        proteina = b3.number_input("Proteína (%)", min_value=0.0, step=0.1)
+        sng = b4.number_input("Sólidos no grasos (%)", min_value=0.0, step=0.1)
+        d1, d2, d3, d4 = st.columns(4)
+        mastitis = d1.selectbox("Detección de mastitis", RESULTADO_MASTITIS)
+        antib = d2.selectbox("Residuos de antibióticos", RESULTADO_ANTIBIOTICOS)
+        agua = d3.number_input("Agua detectada (L)", min_value=0.0, step=1.0)
+        aceptada = d4.number_input("Total de leche aceptada (L)", min_value=0.0, step=10.0)
+        st.caption("Leche aceptada: déjala en 0 para que se calcule sola (litros recibidos − agua). "
+                   "Solo la leche aceptada entra al inventario.")
         aprobada = st.checkbox("Aprobada por control de calidad", value=True)
+        resp = pick_operador("Responsable del análisis (opcional)", obligatorio=False)
         if st.form_submit_button("Registrar recepción"):
             if prov is None:
                 st.error("Falta el proveedor: agrégalo primero en Catálogos → Proveedores.")
             else:
-                guardar(registrar_recepcion, f, prov, litros, grasa, acidez, dens, temp, aprobada)
+                extra = dict(hora=hora.strftime("%H:%M") if hora else None, n_tanques=int(tanques),
+                             n_porongos=int(porongos), procedencia=proced.strip() or None,
+                             ph=ph or None, lactosa=lactosa or None, proteina=proteina or None,
+                             sng=sng or None, mastitis=mastitis, antibioticos=antib, agua_l=agua,
+                             aceptada=aceptada or None, responsable_id=resp)
+                registrada = guardar(lambda *a: registrar_recepcion(*a, **extra),
+                                     f, prov, litros, grasa, acidez, dens, temp, aprobada)
+                if registrada and mastitis == "Positivo" and aprobada:
+                    st.warning("Ojo: la leche tiene mastitis positiva y quedó aprobada. "
+                               "Confírmalo con control de calidad.")
     form_anular("rec", q("""SELECT r.id, 'N°' || r.id || ' · ' || r.fecha || ' · ' ||
                                    COALESCE(v.nombre, 's/proveedor') || ' · ' || r.litros || ' L' AS etiqueta
                             FROM recepcion_leche r LEFT JOIN proveedores v ON v.id = r.proveedor_id
                             WHERE r.anulado = 0 ORDER BY r.id DESC LIMIT 100"""), anular_recepcion)
-    st.dataframe(q("""SELECT r.id AS n, r.fecha, v.nombre AS proveedor, r.litros, r.grasa, r.acidez,
-                      r.densidad, r.temperatura, CASE r.aprobada WHEN 1 THEN 'Sí' ELSE 'No' END AS aprobada,
+    st.dataframe(q("""SELECT r.id AS n, r.fecha, r.hora, v.nombre AS proveedor, r.procedencia, r.litros,
+                      r.n_tanques AS tanques, r.n_porongos AS porongos, r.grasa, r.acidez, r.densidad,
+                      r.temperatura, r.ph, r.lactosa, r.proteina, r.sng, r.mastitis,
+                      r.antibioticos, r.agua_l, r.litros_aceptados AS aceptada_L,
+                      CASE r.aprobada WHEN 1 THEN 'Sí' ELSE 'No' END AS aprobada,
+                      o.nombre AS responsable,
                       CASE r.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
                       r.motivo_anulacion
                       FROM recepcion_leche r LEFT JOIN proveedores v ON v.id = r.proveedor_id
+                      LEFT JOIN operadores o ON o.id = r.responsable_id
                       ORDER BY r.fecha DESC, r.id DESC"""),
                  width="stretch", hide_index=True)
 
@@ -1003,6 +1290,7 @@ def pag_pasteurizacion():
         temp = c5.number_input("Temperatura alcanzada (°C)", min_value=0.0, step=0.5)
         tiempo = c6.number_input("Tiempo de retención (min)", min_value=0.0, step=1.0)
         oper = pick_operador("Operador responsable", obligatorio=True)
+        prod_p = pick_producto_opcional("Producto que se elabora (opcional)", ["Producto terminado"])
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar pasteurización"):
             if not lote.strip():
@@ -1010,7 +1298,7 @@ def pag_pasteurizacion():
             else:
                 try:
                     ok = registrar_pasteurizacion(f, lote.strip(), litros, temp, tiempo,
-                                                  hora.strftime("%H:%M"), oper, obs.strip() or None)
+                                                  hora.strftime("%H:%M"), oper, obs.strip() or None, prod_p)
                     if ok:
                         st.success("Registrado: pasteurización CONFORME.")
                     else:
@@ -1022,12 +1310,14 @@ def pag_pasteurizacion():
                                     ps.litros || ' L' AS etiqueta
                              FROM pasteurizacion ps WHERE ps.anulado = 0
                              ORDER BY ps.id DESC LIMIT 100"""), anular_pasteurizacion)
-    df = q("""SELECT ps.id AS n, ps.fecha, ps.hora_inicio, ps.lote, ps.litros, ps.temperatura,
+    df = q("""SELECT ps.id AS n, ps.fecha, ps.hora_inicio, ps.lote, pp.nombre AS producto, ps.litros,
+                     ps.temperatura,
                      ps.tiempo_min AS "tiempo_min", o.nombre AS operador,
                      CASE ps.conforme WHEN 1 THEN 'Conforme' ELSE 'NO conforme' END AS resultado,
                      CASE ps.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
                      ps.motivo_anulacion, ps.observacion
               FROM pasteurizacion ps JOIN operadores o ON o.id = ps.operador_id
+              LEFT JOIN productos pp ON pp.id = ps.producto_id
               ORDER BY ps.fecha DESC, ps.id DESC""")
     st.dataframe(df, width="stretch", hide_index=True)
 
@@ -1049,12 +1339,35 @@ def pag_produccion():
         suero = s1.number_input("Suero obtenido (L)", min_value=0.0, step=10.0)
         vendido = s2.number_input("Suero vendido (L)", min_value=0.0, step=10.0)
         usado = s3.number_input("Suero usado en planta (L)", min_value=0.0, step=10.0)
+        insumos = []
+        with st.expander("Insumos usados en este lote (opcional)"):
+            st.caption("Se guardan como dato del lote (cantidad, marca, lote y fechas). El almacén de "
+                       "insumos no forma parte del ERP, por eso no descuentan stock.")
+            anchos = [2, 1, 1.5, 1.5, 1.2, 1.2]
+            for col, t in zip(st.columns(anchos), ["Insumo", "Cantidad (g)", "Marca", "Lote", "F.P.", "F.V."]):
+                col.caption(t)
+            for nombre in INSUMOS_PROCESO:
+                k0, k1, k2, k3, k4, k5 = st.columns(anchos)
+                k0.write(nombre)
+                insumos.append({
+                    "insumo": nombre,
+                    "cantidad_g": k1.number_input(f"{nombre} cantidad", min_value=0.0, step=1.0,
+                                                  key=f"ins_c_{nombre}", label_visibility="collapsed"),
+                    "marca": k2.text_input(f"{nombre} marca", key=f"ins_m_{nombre}",
+                                           label_visibility="collapsed"),
+                    "lote": k3.text_input(f"{nombre} lote", key=f"ins_l_{nombre}",
+                                          label_visibility="collapsed"),
+                    "fecha_prod": k4.text_input(f"{nombre} F.P.", key=f"ins_p_{nombre}",
+                                                label_visibility="collapsed", placeholder="mm/aa"),
+                    "fecha_venc": k5.text_input(f"{nombre} F.V.", key=f"ins_v_{nombre}",
+                                                label_visibility="collapsed", placeholder="mm/aa"),
+                })
         if st.form_submit_button("Registrar producción"):
             if not lote.strip():
                 st.error("El lote es obligatorio.")
             else:
-                guardar(registrar_produccion, f, lote.strip(), pid, litros, obtenida, suero,
-                        vendido, usado, oper)
+                guardar(lambda *a: registrar_produccion(*a, insumos=insumos), f, lote.strip(), pid, litros,
+                        obtenida, suero, vendido, usado, oper)
     form_anular("prod", q("""SELECT pr.id, 'N°' || pr.id || ' · ' || pr.fecha || ' · lote ' || pr.lote || ' · ' ||
                                     p.nombre || ' · ' || pr.cantidad_obtenida AS etiqueta
                              FROM produccion pr JOIN productos p ON p.id = pr.producto_id
@@ -1070,6 +1383,13 @@ def pag_produccion():
               LEFT JOIN operadores o ON o.id = pr.operador_id
               ORDER BY pr.fecha DESC, pr.id DESC""")
     st.dataframe(df, width="stretch", hide_index=True)
+    with st.expander("Insumos usados por lote"):
+        st.dataframe(q("""SELECT pr.fecha, pr.lote, p.nombre AS producto, i.insumo, i.cantidad_g,
+                                 i.marca, i.lote AS lote_insumo, i.fecha_prod AS F_P, i.fecha_venc AS F_V
+                          FROM produccion_insumos i JOIN produccion pr ON pr.id = i.produccion_id
+                          JOIN productos p ON p.id = pr.producto_id
+                          WHERE pr.anulado = 0 ORDER BY pr.fecha DESC, pr.id DESC, i.id"""),
+                     width="stretch", hide_index=True)
 
 
 def pag_despachos():
@@ -1077,26 +1397,31 @@ def pag_despachos():
     with st.form("f_desp", clear_on_submit=True):
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha", date.today())
-        cliente = c2.text_input("Cliente")
+        destino = pick_destino("Tienda de destino")
+        cliente = c2.text_input("Cliente (si no es una tienda)")
         pid = pick_producto("Producto", ["Producto terminado"])
         c3, c4, c5 = st.columns(3)
         pedida = c3.number_input("Cantidad pedida", min_value=0.0, step=1.0)
         desp = c4.number_input("Cantidad despachada", min_value=0.0, step=1.0)
         doc = c5.text_input("N° de guía")
+        resp = pick_operador("Responsable del envío (opcional)", obligatorio=False)
         if st.form_submit_button("Registrar despacho"):
-            if not cliente.strip() or pedida <= 0:
-                st.error("Cliente y cantidad pedida son obligatorios.")
+            if pedida <= 0:
+                st.error("La cantidad pedida es obligatoria.")
             else:
-                guardar(registrar_despacho, f, cliente.strip(), pid, pedida, desp, doc.strip() or None)
+                guardar(registrar_despacho, f, cliente.strip(), pid, pedida, desp, doc.strip() or None,
+                        destino, resp)
     form_anular("desp", q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' ||
                                     p.nombre || ' · ' || d.cant_despachada AS etiqueta
                              FROM pedidos d JOIN productos p ON p.id = d.producto_id
                              WHERE d.anulado = 0 ORDER BY d.id DESC LIMIT 100"""), anular_despacho)
     st.dataframe(q("""SELECT d.id AS n, d.fecha, d.cliente, p.nombre AS producto, d.cant_pedida,
                       d.cant_despachada, ROUND(d.cant_despachada * 100.0 / d.cant_pedida, 1) AS "fill_rate_%",
-                      d.documento, CASE d.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
+                      d.documento, o.nombre AS responsable_envio,
+                      CASE d.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
                       d.motivo_anulacion
                       FROM pedidos d JOIN productos p ON p.id = d.producto_id
+                      LEFT JOIN operadores o ON o.id = d.responsable_envio_id
                       ORDER BY d.fecha DESC, d.id DESC"""),
                  width="stretch", hide_index=True)
 
@@ -1111,34 +1436,109 @@ def pag_devoluciones():
     with st.form("f_dev", clear_on_submit=True):
         origen = st.selectbox("Despacho de origen (opcional)", [None] + list(opts_d),
                               format_func=lambda i: opts_d.get(i, "(sin despacho de origen)"))
-        st.caption("Si eliges un despacho, se usan su cliente y su producto, y no se puede devolver "
-                   "más de lo que se despachó. Si no, llena cliente y producto.")
+        st.caption("Si eliges un despacho, se usan su tienda o cliente y su producto, y no se puede devolver "
+                   "más de lo que se despachó. Si no, indica la tienda o el cliente y el producto.")
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha de devolución", date.today())
-        cliente = c2.text_input("Cliente (si no elegiste despacho)")
+        with c2:
+            destino = pick_destino("Tienda que devuelve")
+        cliente = st.text_input("Cliente (si no es una tienda ni elegiste despacho)")
         pid = pick_producto("Producto (si no elegiste despacho)", ["Producto terminado"])
         c3, c4 = st.columns(2)
         cant = c3.number_input("Cantidad devuelta", min_value=0.0, step=1.0)
         doc = c4.text_input("N° de guía o documento")
         c5, c6 = st.columns(2)
         motivo = c5.selectbox("Motivo de la devolución", MOTIVOS_DEVOLUCION)
-        destino = c6.selectbox("¿Qué pasa con el producto?", [DESTINO_REINGRESO, DESTINO_MERMA])
+        destino_prod = c6.selectbox("¿Qué pasa con el producto?", [DESTINO_REINGRESO, DESTINO_MERMA])
         st.caption("«Reingresa al almacén» suma la cantidad al stock. «Merma» queda registrada, "
                    "pero no vuelve al stock.")
+        resp = pick_operador("Encargado / responsable (opcional)", obligatorio=False)
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar devolución"):
-            guardar(registrar_devolucion, f, cliente.strip(), pid, cant, motivo, destino, origen,
-                    doc.strip() or None, obs.strip() or None)
+            guardar(registrar_devolucion, f, cliente.strip(), pid, cant, motivo, destino_prod, origen,
+                    doc.strip() or None, obs.strip() or None, destino, resp)
     form_anular("dev", q("""SELECT dv.id, 'N°' || dv.id || ' · ' || dv.fecha || ' · ' || dv.cliente || ' · ' ||
                                    p.nombre || ' · ' || dv.cantidad AS etiqueta
                             FROM devoluciones dv JOIN productos p ON p.id = dv.producto_id
                             WHERE dv.anulado = 0 ORDER BY dv.id DESC LIMIT 100"""), anular_devolucion)
     st.dataframe(q("""SELECT dv.id AS n, dv.fecha, dv.cliente, p.nombre AS producto, dv.cantidad,
-                      dv.motivo, dv.destino, dv.despacho_id AS despacho_n, dv.documento, dv.observacion,
+                      dv.motivo, dv.destino, dv.despacho_id AS despacho_n, dv.documento,
+                      o.nombre AS responsable, dv.observacion,
                       CASE dv.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
                       dv.motivo_anulacion
                       FROM devoluciones dv JOIN productos p ON p.id = dv.producto_id
+                      LEFT JOIN operadores o ON o.id = dv.responsable_id
                       ORDER BY dv.fecha DESC, dv.id DESC"""),
+                 width="stretch", hide_index=True)
+
+
+def pag_programacion():
+    st.header("Programación diaria")
+    with st.form("f_prog", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        f = c1.date_input("Fecha programada", date.today())
+        litros = c2.number_input("Litros de leche programados", min_value=0.0, step=10.0)
+        pid = pick_producto("Producto a elaborar", ["Producto terminado"])
+        oper = pick_operador("Responsable (opcional)", obligatorio=False)
+        obs = st.text_input("Observaciones (opcional)")
+        if st.form_submit_button("Registrar programación"):
+            guardar(registrar_programacion, f, pid, litros, oper, obs.strip() or None)
+    form_anular("prog", q("""SELECT g.id, 'N°' || g.id || ' · ' || g.fecha || ' · ' || p.nombre || ' · ' ||
+                                    g.litros_programados || ' L' AS etiqueta
+                             FROM programacion g JOIN productos p ON p.id = g.producto_id
+                             WHERE g.anulado = 0 ORDER BY g.id DESC LIMIT 100"""), anular_programacion)
+    st.subheader("Programado vs producido")
+    st.caption("«Litros usados» son los litros de leche de las producciones registradas ese día para ese producto.")
+    st.dataframe(q("""SELECT g.id AS n, g.fecha, p.nombre AS producto, o.nombre AS responsable,
+                      g.litros_programados, COALESCE(u.usados, 0) AS litros_usados,
+                      ROUND(COALESCE(u.usados, 0) * 100.0 / g.litros_programados, 1) AS "cumplimiento_%",
+                      g.observacion, CASE g.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
+                      g.motivo_anulacion
+                      FROM programacion g JOIN productos p ON p.id = g.producto_id
+                      LEFT JOIN operadores o ON o.id = g.responsable_id
+                      LEFT JOIN (SELECT fecha, producto_id, SUM(litros_leche) AS usados FROM produccion
+                                 WHERE anulado = 0 GROUP BY fecha, producto_id) u
+                             ON u.fecha = g.fecha AND u.producto_id = g.producto_id
+                      ORDER BY g.fecha DESC, g.id DESC"""),
+                 width="stretch", hide_index=True)
+
+
+def pag_trazabilidad():
+    st.header("Trazabilidad de producto terminado")
+    st.caption("Cada producción abre su registro solo (lote, producto, responsable y fecha de producción). "
+               "Aquí completas las etapas a medida que ocurren.")
+    vig = q("""SELECT t.id, 'N°' || t.id || ' · lote ' || COALESCE(t.lote, '-') || ' · ' || p.nombre ||
+                      ' · producido ' || t.fecha_produccion AS etiqueta
+               FROM trazabilidad t JOIN productos p ON p.id = t.producto_id
+               WHERE t.anulado = 0 ORDER BY t.id DESC LIMIT 200""")
+    if vig.empty:
+        st.info("Aún no hay lotes: se crean automáticamente al registrar una producción.")
+    else:
+        with st.expander("Registrar etapa de un lote (empaque, envasado, maduración, salida)", expanded=True):
+            opts = dict(zip(vig.id.tolist(), vig.etiqueta.tolist()))
+            sel = st.selectbox("Lote", list(opts), format_func=opts.get)
+            with st.form("f_traz", clear_on_submit=True):
+                t1, t2 = st.columns(2)
+                d_emp = t1.date_input("Ingreso al área de empaque", value=None)
+                d_env = t2.date_input("Envasado", value=None)
+                t3, t4 = st.columns(2)
+                d_mad = t3.date_input("Ingreso a la cámara de maduración", value=None)
+                d_sal = t4.date_input("Salida del producto", value=None)
+                destino = pick_destino("Destino")
+                obs = st.text_input("Observaciones (opcional)")
+                if st.form_submit_button("Guardar etapas"):
+                    guardar(actualizar_trazabilidad, sel, d_emp, d_env, d_mad, d_sal, destino,
+                            obs.strip() or None, ok="Etapas guardadas.")
+    solo_pend = st.checkbox("Solo lotes que aún no salieron")
+    filtro = "WHERE t.anulado = 0 AND t.fecha_salida IS NULL" if solo_pend else ""
+    st.dataframe(q(f"""SELECT t.id AS n, t.lote, p.nombre AS producto, o.nombre AS responsable,
+                       t.fecha_produccion, t.fecha_empaque, t.fecha_envasado, t.fecha_maduracion,
+                       t.fecha_salida, d.nombre AS destino, t.observacion,
+                       CASE t.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado
+                       FROM trazabilidad t JOIN productos p ON p.id = t.producto_id
+                       LEFT JOIN operadores o ON o.id = t.responsable_id
+                       LEFT JOIN destinos d ON d.id = t.destino_id
+                       {filtro} ORDER BY t.fecha_produccion DESC, t.id DESC"""),
                  width="stretch", hide_index=True)
 
 
@@ -1268,11 +1668,13 @@ def resumen_periodo(desde, hasta):
     d, h = str(desde), str(hasta)
     ind = indicadores(desde, hasta, 0)
     leche = q("SELECT COALESCE(SUM(litros), 0) AS v FROM recepcion_leche "
-              "WHERE anulado=0 AND aprobada=1 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
+              "WHERE anulado=0 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
+    aceptada = q("SELECT COALESCE(SUM(COALESCE(litros_aceptados, litros)), 0) AS v FROM recepcion_leche "
+                 "WHERE anulado=0 AND aprobada=1 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
     usada = q("SELECT COALESCE(SUM(litros_leche), 0) AS v FROM produccion "
               "WHERE anulado=0 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
     return {
-        "leche_recibida": float(leche), "leche_usada": float(usada),
+        "leche_recibida": float(leche), "leche_aceptada": float(aceptada), "leche_usada": float(usada),
         "producido": _suma_por_unidad("produccion", "cantidad_obtenida", d, h),
         "despachado": _suma_por_unidad("pedidos", "cant_despachada", d, h),
         "devuelto": _suma_por_unidad("devoluciones", "cantidad", d, h),
@@ -1288,7 +1690,8 @@ def fila_resumen(etiqueta, r):
         return None if v is None or pd.isna(v) else round(float(v), 1)
     return {
         "periodo": etiqueta,
-        "leche_recibida_L": round(r["leche_recibida"], 1), "leche_usada_L": round(r["leche_usada"], 1),
+        "leche_recibida_L": round(r["leche_recibida"], 1), "leche_aceptada_L": round(r["leche_aceptada"], 1),
+        "leche_usada_L": round(r["leche_usada"], 1),
         "producción_kg": r["producido"].get("kg", 0.0), "producción_L": r["producido"].get("L", 0.0),
         "despachado_kg": r["despachado"].get("kg", 0.0), "despachado_L": r["despachado"].get("L", 0.0),
         "devuelto_kg": r["devuelto"].get("kg", 0.0), "devuelto_L": r["devuelto"].get("L", 0.0),
@@ -1336,21 +1739,23 @@ def texto_unidades(dic):
 
 
 def tarjetas_resumen(r):
-    a1, a2, a3, a4 = st.columns(4)
+    a1, a2, a3 = st.columns(3)
     a1.metric("Leche recibida", f"{r['leche_recibida']:,.1f} L")
-    a2.metric("Leche usada en producción", f"{r['leche_usada']:,.1f} L")
-    a3.metric("Producción", texto_unidades(r["producido"]))
-    a4.metric("Despachado", texto_unidades(r["despachado"]))
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Devuelto", texto_unidades(r["devuelto"]))
-    b2.metric("Fill rate (meta ≥80%)", fmt(r["fill_rate"]))
-    b3.metric("Recuperación de leche", fmt(r["recuperacion"]))
-    merma = r["merma_suero_l"]
-    b4.metric("Merma de suero", "s/d" if merma is None else f"{merma:,.1f} L ({fmt(r['merma_suero_pct'])})")
+    a2.metric("Leche aceptada", f"{r['leche_aceptada']:,.1f} L")
+    a3.metric("Leche usada en producción", f"{r['leche_usada']:,.1f} L")
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Producción", texto_unidades(r["producido"]))
+    b2.metric("Despachado", texto_unidades(r["despachado"]))
+    b3.metric("Devuelto", texto_unidades(r["devuelto"]))
     c1, c2, c3 = st.columns(3)
-    c1.metric("Exactitud del inventario (meta ≥95%)", fmt(r["exactitud"]))
-    c2.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']})", fmt(r["past_conforme"]))
-    c3.metric("Tasa de devoluciones", fmt(r["tasa_devoluciones"]))
+    c1.metric("Fill rate (meta ≥80%)", fmt(r["fill_rate"]))
+    c2.metric("Recuperación de leche", fmt(r["recuperacion"]))
+    merma = r["merma_suero_l"]
+    c3.metric("Merma de suero", "s/d" if merma is None else f"{merma:,.1f} L ({fmt(r['merma_suero_pct'])})")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Exactitud del inventario (meta ≥95%)", fmt(r["exactitud"]))
+    d2.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']})", fmt(r["past_conforme"]))
+    d3.metric("Tasa de devoluciones", fmt(r["tasa_devoluciones"]))
 
 
 ESTILO_RESUMEN = """<style>
@@ -1426,9 +1831,11 @@ PAGINAS = {
     "Panel": pag_dashboard,
     "Resumen": pag_resumen,
     "Catálogos": pag_catalogos,
-    "Recepción de leche": pag_recepcion,
+    "Programación diaria": pag_programacion,
+    "Llegada y análisis de leche": pag_recepcion,
     "Pasteurización": pag_pasteurizacion,
     "Producción y mermas": pag_produccion,
+    "Trazabilidad": pag_trazabilidad,
     "Pedidos y despachos": pag_despachos,
     "Pedidos devueltos": pag_devoluciones,
     "Almacén de producto terminado": pag_almacen_pt,
