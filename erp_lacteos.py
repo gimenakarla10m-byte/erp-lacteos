@@ -2,7 +2,8 @@
 ERP de inventarios para planta de lácteos
 =========================================
 Módulos: catálogos (productos, proveedores, operadores), recepción de leche,
-pasteurización, producción (con suero y mermas), pedidos/despachos, Kardex
+pasteurización, producción (con suero y mermas), pedidos/despachos, pedidos devueltos,
+almacén de producto terminado, resumen por semana/mes/año, Kardex
 transaccional, inventario físico e indicadores.
 
 Requisitos:   pip install "streamlit>=1.50" pandas
@@ -13,7 +14,8 @@ Regla central: NO se edita el stock a mano; el stock siempre es la suma de
 los movimientos del Kardex (ENTRADA - SALIDA).
 """
 import sqlite3
-from datetime import date
+from calendar import monthrange
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -22,6 +24,12 @@ DB = "erp_lacteos.db"
 
 TIPOS_PRODUCTO = ["Materia prima", "Insumo", "Producto terminado", "Subproducto"]
 UNIDADES = ["kg", "L", "empaque", "unidad"]
+MOTIVOS_DEVOLUCION = ["Producto en mal estado", "Error en el pedido", "Rechazo del cliente",
+                      "Producto vencido", "Empaque dañado", "Otro"]
+DESTINO_REINGRESO = "Reingresa al almacén"
+DESTINO_MERMA = "Merma (ya no se puede vender)"
+MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO",
+         "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
 VERSION_CATALOGO = 2
 
 SCHEMA = """
@@ -99,6 +107,20 @@ CREATE TABLE IF NOT EXISTS pedidos (
     cant_pedida REAL NOT NULL,
     cant_despachada REAL NOT NULL,
     documento TEXT
+);
+CREATE TABLE IF NOT EXISTS devoluciones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fecha TEXT NOT NULL,
+    cliente TEXT NOT NULL,
+    producto_id INTEGER NOT NULL REFERENCES productos(id),
+    cantidad REAL NOT NULL,
+    motivo TEXT NOT NULL,
+    destino TEXT NOT NULL,
+    despacho_id INTEGER REFERENCES pedidos(id),
+    documento TEXT,
+    observacion TEXT,
+    anulado INTEGER NOT NULL DEFAULT 0,
+    motivo_anulacion TEXT
 );
 CREATE TABLE IF NOT EXISTS conteos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,6 +285,9 @@ def transaccion(fn):
 
 # ── Operaciones de negocio ──
 def registrar_recepcion(fecha, proveedor_id, litros, grasa, acidez, densidad, temp, aprobada):
+    if litros <= 0:
+        raise ValueError("Los litros recibidos deben ser mayores que cero.")
+
     def _op(con):
         con.execute(
             "INSERT INTO recepcion_leche (fecha, proveedor_id, litros, grasa, acidez, densidad, "
@@ -382,8 +407,22 @@ def anular_produccion(rid, motivo):
     _transaccion_anulacion(_op)
 
 
+def anular_devolucion(rid, motivo):
+    def _op(con):
+        _marcar_anulado(con, "devoluciones", rid, motivo)
+        pid, cantidad, destino = con.execute(
+            "SELECT producto_id, cantidad, destino FROM devoluciones WHERE id=?", (rid,)).fetchone()
+        if destino == DESTINO_REINGRESO:  # lo que había reingresado al stock se retira
+            mover(con, date.today(), pid, "SALIDA", "Anulación de devolución", cantidad,
+                  f"ANUL-DEV-{rid}", motivo)
+    _transaccion_anulacion(_op)
+
+
 def anular_despacho(rid, motivo):
     def _op(con):
+        if con.execute("SELECT COUNT(*) FROM devoluciones WHERE despacho_id=? AND anulado=0",
+                       (rid,)).fetchone()[0]:
+            raise ValueError("Ese despacho tiene devoluciones registradas: anúlalas primero.")
         _marcar_anulado(con, "pedidos", rid, motivo)
         pid, despachada = con.execute(
             "SELECT producto_id, cant_despachada FROM pedidos WHERE id=?", (rid,)).fetchone()
@@ -517,6 +556,35 @@ def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento):
     transaccion(_op)
 
 
+def registrar_devolucion(fecha, cliente, pid, cantidad, motivo, destino, despacho_id=None,
+                         documento=None, observacion=None):
+    if cantidad <= 0:
+        raise ValueError("La cantidad devuelta debe ser mayor que cero.")
+    if despacho_id is None and not (cliente or "").strip():
+        raise ValueError("Indica el cliente o elige el despacho de origen.")
+
+    def _op(con):
+        cli, prod = cliente, pid
+        if despacho_id is not None:
+            fila = con.execute("SELECT cliente, producto_id, cant_despachada, anulado "
+                               "FROM pedidos WHERE id=?", (despacho_id,)).fetchone()
+            if fila is None or fila[3]:
+                raise ValueError("El despacho elegido no existe o está anulado.")
+            cli, prod, despachada = fila[0], fila[1], fila[2]
+            ya = con.execute("SELECT COALESCE(SUM(cantidad), 0) FROM devoluciones "
+                             "WHERE despacho_id=? AND anulado=0", (despacho_id,)).fetchone()[0]
+            if cantidad + ya > despachada + 1e-9:
+                raise ValueError(f"Ese despacho fue de {despachada:g} y ya se devolvieron {ya:g}; "
+                                 f"no se pueden devolver {cantidad:g} más.")
+        con.execute(
+            "INSERT INTO devoluciones (fecha, cliente, producto_id, cantidad, motivo, destino, "
+            "despacho_id, documento, observacion) VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(fecha), cli, prod, cantidad, motivo, destino, despacho_id, documento, observacion))
+        if destino == DESTINO_REINGRESO:
+            mover(con, fecha, prod, "ENTRADA", "Devolución de cliente", cantidad, documento, cli)
+    transaccion(_op)
+
+
 def registrar_conteo(fecha, pid, fisico, ajustar):
     def _op(con):
         sistema = stock_de(con, pid)
@@ -594,6 +662,15 @@ def indicadores(desde, hasta, docs_fisicos=0):
     pa = q("SELECT conforme FROM pasteurizacion WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
     out["pasteurizacion_conforme"] = (pa.conforme.mean() * 100) if len(pa) else None
     out["pasteurizaciones"] = len(pa)
+
+    # 6) Tasa de devoluciones = cantidad devuelta / cantidad despachada x 100
+    dv = q("SELECT COALESCE(SUM(cantidad), 0) AS dev FROM devoluciones "
+           "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
+    despachado = p.des[0]
+    out["devuelto"] = float(dv.dev[0])
+    out["tasa_devoluciones"] = (dv.dev[0] / despachado * 100
+                                if despachado is not None and pd.notna(despachado) and despachado > 0
+                                else None)
     return out
 
 
@@ -866,8 +943,8 @@ def form_anular(key, vigentes, fn):
 
 def pag_recepcion():
     st.header("Recepción de leche")
-    prov = pick_proveedor()
     with st.form("f_rec", clear_on_submit=True):
+        prov = pick_proveedor()
         f = st.date_input("Fecha", date.today())
         litros = st.number_input("Litros recibidos", min_value=0.0, step=10.0)
         c1, c2, c3, c4 = st.columns(4)
@@ -876,8 +953,11 @@ def pag_recepcion():
         dens = c3.number_input("Densidad", min_value=0.0, step=0.001, format="%.3f")
         temp = c4.number_input("Temp. (°C)", min_value=0.0, step=0.5)
         aprobada = st.checkbox("Aprobada por control de calidad", value=True)
-        if st.form_submit_button("Registrar recepción") and prov is not None:
-            guardar(registrar_recepcion, f, prov, litros, grasa, acidez, dens, temp, aprobada)
+        if st.form_submit_button("Registrar recepción"):
+            if prov is None:
+                st.error("Falta el proveedor: agrégalo primero en Catálogos → Proveedores.")
+            else:
+                guardar(registrar_recepcion, f, prov, litros, grasa, acidez, dens, temp, aprobada)
     form_anular("rec", q("""SELECT r.id, 'N°' || r.id || ' · ' || r.fecha || ' · ' ||
                                    COALESCE(v.nombre, 's/proveedor') || ' · ' || r.litros || ' L' AS etiqueta
                             FROM recepcion_leche r LEFT JOIN proveedores v ON v.id = r.proveedor_id
@@ -1021,6 +1101,96 @@ def pag_despachos():
                  width="stretch", hide_index=True)
 
 
+def pag_devoluciones():
+    st.header("Pedidos devueltos")
+    desp = q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' || p.nombre ||
+                       ' · despachado ' || d.cant_despachada AS etiqueta
+                FROM pedidos d JOIN productos p ON p.id = d.producto_id
+                WHERE d.anulado = 0 AND d.cant_despachada > 0 ORDER BY d.id DESC LIMIT 100""")
+    opts_d = dict(zip(desp.id.tolist(), desp.etiqueta.tolist()))
+    with st.form("f_dev", clear_on_submit=True):
+        origen = st.selectbox("Despacho de origen (opcional)", [None] + list(opts_d),
+                              format_func=lambda i: opts_d.get(i, "(sin despacho de origen)"))
+        st.caption("Si eliges un despacho, se usan su cliente y su producto, y no se puede devolver "
+                   "más de lo que se despachó. Si no, llena cliente y producto.")
+        c1, c2 = st.columns(2)
+        f = c1.date_input("Fecha de devolución", date.today())
+        cliente = c2.text_input("Cliente (si no elegiste despacho)")
+        pid = pick_producto("Producto (si no elegiste despacho)", ["Producto terminado"])
+        c3, c4 = st.columns(2)
+        cant = c3.number_input("Cantidad devuelta", min_value=0.0, step=1.0)
+        doc = c4.text_input("N° de guía o documento")
+        c5, c6 = st.columns(2)
+        motivo = c5.selectbox("Motivo de la devolución", MOTIVOS_DEVOLUCION)
+        destino = c6.selectbox("¿Qué pasa con el producto?", [DESTINO_REINGRESO, DESTINO_MERMA])
+        st.caption("«Reingresa al almacén» suma la cantidad al stock. «Merma» queda registrada, "
+                   "pero no vuelve al stock.")
+        obs = st.text_input("Observaciones (opcional)")
+        if st.form_submit_button("Registrar devolución"):
+            guardar(registrar_devolucion, f, cliente.strip(), pid, cant, motivo, destino, origen,
+                    doc.strip() or None, obs.strip() or None)
+    form_anular("dev", q("""SELECT dv.id, 'N°' || dv.id || ' · ' || dv.fecha || ' · ' || dv.cliente || ' · ' ||
+                                   p.nombre || ' · ' || dv.cantidad AS etiqueta
+                            FROM devoluciones dv JOIN productos p ON p.id = dv.producto_id
+                            WHERE dv.anulado = 0 ORDER BY dv.id DESC LIMIT 100"""), anular_devolucion)
+    st.dataframe(q("""SELECT dv.id AS n, dv.fecha, dv.cliente, p.nombre AS producto, dv.cantidad,
+                      dv.motivo, dv.destino, dv.despacho_id AS despacho_n, dv.documento, dv.observacion,
+                      CASE dv.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
+                      dv.motivo_anulacion
+                      FROM devoluciones dv JOIN productos p ON p.id = dv.producto_id
+                      ORDER BY dv.fecha DESC, dv.id DESC"""),
+                 width="stretch", hide_index=True)
+
+
+def pag_almacen_pt():
+    st.header("Almacén de producto terminado")
+    c1, c2, c3 = st.columns(3)
+    desde = c1.date_input("Desde", date(date.today().year, 1, 1), key="alm_desde")
+    hasta = c2.date_input("Hasta", date.today(), key="alm_hasta")
+    solo_stock = c3.checkbox("Solo productos con stock")
+    d, h = str(desde), str(hasta)
+
+    base = stock_actual()
+    base = base[base.tipo == "Producto terminado"][["id", "nombre", "unidad", "stock", "stock_minimo"]].copy()
+    flujos = {
+        "producido": ("SELECT producto_id, SUM(cantidad_obtenida) AS total FROM produccion "
+                      "WHERE anulado=0 AND fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
+        "despachado": ("SELECT producto_id, SUM(cant_despachada) AS total FROM pedidos "
+                       "WHERE anulado=0 AND fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
+        "devuelto_reingresado": ("SELECT producto_id, SUM(cantidad) AS total FROM devoluciones "
+                                 "WHERE anulado=0 AND destino=? AND fecha BETWEEN ? AND ? "
+                                 "GROUP BY producto_id", (DESTINO_REINGRESO, d, h)),
+        "devuelto_merma": ("SELECT producto_id, SUM(cantidad) AS total FROM devoluciones "
+                           "WHERE anulado=0 AND destino=? AND fecha BETWEEN ? AND ? "
+                           "GROUP BY producto_id", (DESTINO_MERMA, d, h)),
+    }
+    for col, (sql, params) in flujos.items():
+        serie = q(sql, params).set_index("producto_id")["total"]
+        base[col] = base["id"].map(serie).fillna(0.0)
+    ultimo = q("SELECT producto_id, MAX(fecha) AS ultimo FROM movimientos GROUP BY producto_id")
+    base["ultimo_movimiento"] = base["id"].map(ultimo.set_index("producto_id")["ultimo"])
+
+    def estado(r):
+        if r.stock <= 0:
+            return "Sin stock"
+        if r.stock_minimo > 0 and r.stock < r.stock_minimo:
+            return "⚠️ Bajo mínimo"
+        return "OK"
+
+    base["estado"] = base.apply(estado, axis=1)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Productos con stock", int((base.stock > 0).sum()))
+    m2.metric("Productos sin stock", int((base.stock <= 0).sum()))
+    m3.metric("Bajo stock mínimo", int((base.estado == "⚠️ Bajo mínimo").sum()))
+    if solo_stock:
+        base = base[base.stock > 0]
+    st.caption("Producido, despachado y devuelto corresponden al periodo elegido; el stock es el actual. "
+               "El detalle de cada movimiento está en el Kardex.")
+    st.dataframe(base[["nombre", "unidad", "stock", "estado", "producido", "despachado",
+                       "devuelto_reingresado", "devuelto_merma", "stock_minimo", "ultimo_movimiento"]],
+                 width="stretch", hide_index=True)
+
+
 def pag_kardex():
     st.header("Kardex")
     st.caption("El Kardex no se edita a mano: refleja todos los movimientos. Si hubo un error, anula el "
@@ -1074,7 +1244,8 @@ def pag_indicadores():
     m2.metric("Exactitud del inventario (meta ≥95%)", fmt(r["exactitud"]))
     m3.metric("Fill rate (meta ≥80%)", fmt(r["fill_rate"]))
     m4.metric("Recuperación de leche", fmt(r["recuperacion_global"]))
-    n1, n2 = st.columns(2)
+    n1, n2, n3 = st.columns(3)
+    n3.metric("Tasa de devoluciones", fmt(r["tasa_devoluciones"]))
     if r["suero_merma_l"] is not None:
         n1.metric("Merma de suero (L)", f"{r['suero_merma_l']:.1f}  ({fmt(r['suero_merma_%'])})")
     n2.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']} en el periodo)",
@@ -1084,13 +1255,183 @@ def pag_indicadores():
         st.dataframe(r["detalle_produccion"], width="stretch", hide_index=True)
 
 
+# ─────────────────────────── Resumen por semana / mes / año ───────────────────────────
+def _suma_por_unidad(tabla, campo, d, h):
+    df = q(f"""SELECT p.unidad, SUM(t.{campo}) AS total FROM {tabla} t
+               JOIN productos p ON p.id = t.producto_id
+               WHERE t.anulado = 0 AND t.fecha BETWEEN ? AND ? GROUP BY p.unidad""", (d, h))
+    return {r.unidad: float(r.total) for r in df.itertuples()}
+
+
+def resumen_periodo(desde, hasta):
+    """Todas las cifras de un periodo (los registros anulados no cuentan)."""
+    d, h = str(desde), str(hasta)
+    ind = indicadores(desde, hasta, 0)
+    leche = q("SELECT COALESCE(SUM(litros), 0) AS v FROM recepcion_leche "
+              "WHERE anulado=0 AND aprobada=1 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
+    usada = q("SELECT COALESCE(SUM(litros_leche), 0) AS v FROM produccion "
+              "WHERE anulado=0 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
+    return {
+        "leche_recibida": float(leche), "leche_usada": float(usada),
+        "producido": _suma_por_unidad("produccion", "cantidad_obtenida", d, h),
+        "despachado": _suma_por_unidad("pedidos", "cant_despachada", d, h),
+        "devuelto": _suma_por_unidad("devoluciones", "cantidad", d, h),
+        "fill_rate": ind["fill_rate"], "recuperacion": ind["recuperacion_global"],
+        "merma_suero_l": ind["suero_merma_l"], "merma_suero_pct": ind["suero_merma_%"],
+        "exactitud": ind["exactitud"], "past_conforme": ind["pasteurizacion_conforme"],
+        "pasteurizaciones": ind["pasteurizaciones"], "tasa_devoluciones": ind["tasa_devoluciones"],
+    }
+
+
+def fila_resumen(etiqueta, r):
+    def redondear(v):
+        return None if v is None or pd.isna(v) else round(float(v), 1)
+    return {
+        "periodo": etiqueta,
+        "leche_recibida_L": round(r["leche_recibida"], 1), "leche_usada_L": round(r["leche_usada"], 1),
+        "producción_kg": r["producido"].get("kg", 0.0), "producción_L": r["producido"].get("L", 0.0),
+        "despachado_kg": r["despachado"].get("kg", 0.0), "despachado_L": r["despachado"].get("L", 0.0),
+        "devuelto_kg": r["devuelto"].get("kg", 0.0), "devuelto_L": r["devuelto"].get("L", 0.0),
+        "fill_rate_%": redondear(r["fill_rate"]), "recuperación_%": redondear(r["recuperacion"]),
+        "merma_suero_L": redondear(r["merma_suero_l"]), "exactitud_%": redondear(r["exactitud"]),
+        "pasteurización_conforme_%": redondear(r["past_conforme"]),
+    }
+
+
+def tabla_resumen(filas):
+    df = pd.DataFrame(filas)
+    for col in ("producción_L", "despachado_L", "devuelto_L"):  # se oculta si no hay productos en litros
+        if col in df and (df[col] == 0).all():
+            df = df.drop(columns=col)
+    return df
+
+
+def semanas_del_mes(anio, mes):
+    """Semanas de lunes a domingo, recortadas al mes."""
+    ultimo = date(anio, mes, monthrange(anio, mes)[1])
+    ini, n, out = date(anio, mes, 1), 1, []
+    while ini <= ultimo:
+        fin = min(ini + timedelta(days=6 - ini.weekday()), ultimo)
+        out.append((f"Semana {n} ({ini:%d/%m} – {fin:%d/%m})", ini, fin))
+        ini, n = fin + timedelta(days=1), n + 1
+    return out
+
+
+def tabla_por_producto(d, h):
+    def serie(tabla, campo):
+        return q(f"""SELECT p.nombre, SUM(t.{campo}) AS total FROM {tabla} t
+                     JOIN productos p ON p.id = t.producto_id
+                     WHERE t.anulado = 0 AND t.fecha BETWEEN ? AND ? GROUP BY p.nombre""",
+                 (d, h)).set_index("nombre")["total"]
+    df = pd.concat({"producido": serie("produccion", "cantidad_obtenida"),
+                    "despachado": serie("pedidos", "cant_despachada"),
+                    "devuelto": serie("devoluciones", "cantidad")}, axis=1).fillna(0.0)
+    df.index.name = "producto"
+    return df.reset_index()
+
+
+def texto_unidades(dic):
+    partes = [f"{v:,.1f} {u}" for u, v in dic.items() if v]
+    return " · ".join(partes) if partes else "0"
+
+
+def tarjetas_resumen(r):
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Leche recibida", f"{r['leche_recibida']:,.1f} L")
+    a2.metric("Leche usada en producción", f"{r['leche_usada']:,.1f} L")
+    a3.metric("Producción", texto_unidades(r["producido"]))
+    a4.metric("Despachado", texto_unidades(r["despachado"]))
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Devuelto", texto_unidades(r["devuelto"]))
+    b2.metric("Fill rate (meta ≥80%)", fmt(r["fill_rate"]))
+    b3.metric("Recuperación de leche", fmt(r["recuperacion"]))
+    merma = r["merma_suero_l"]
+    b4.metric("Merma de suero", "s/d" if merma is None else f"{merma:,.1f} L ({fmt(r['merma_suero_pct'])})")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Exactitud del inventario (meta ≥95%)", fmt(r["exactitud"]))
+    c2.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']})", fmt(r["past_conforme"]))
+    c3.metric("Tasa de devoluciones", fmt(r["tasa_devoluciones"]))
+
+
+ESTILO_RESUMEN = """<style>
+div[data-testid="stButton"] button[data-testid="stBaseButton-secondary"] {
+    height: 3.2rem; font-weight: 700; background: #339966; color: #000;
+    border: 2px solid #1f2a5c; border-radius: 4px; }
+div[data-testid="stButton"] button[data-testid="stBaseButton-secondary"]:hover {
+    background: #2b8558; color: #000; border-color: #1f2a5c; }
+div[data-testid="stButton"] button[data-testid="stBaseButton-primary"] {
+    height: 3.2rem; font-weight: 700; background: #1e6b45; color: #fff;
+    border: 2px solid #1f2a5c; border-radius: 4px; }
+</style>"""
+
+
+def pag_resumen():
+    st.markdown(ESTILO_RESUMEN, unsafe_allow_html=True)
+    st.markdown("### <u>RESUMEN:</u>", unsafe_allow_html=True)
+
+    hoy = date.today()
+    primero = q("SELECT MIN(fecha) AS f FROM movimientos").f[0]
+    anio_ini = int(str(primero)[:4]) if primero else hoy.year
+    anios = list(range(hoy.year, min(anio_ini, hoy.year) - 1, -1))
+    anio = st.selectbox("Año", anios, key="res_anio")
+
+    if "res_sel" not in st.session_state:
+        st.session_state["res_sel"] = hoy.month      # 1..12 = mes, 0 = año completo
+    sel = st.session_state["res_sel"]
+
+    for fila in range(3):                             # 12 meses en una cuadrícula de 4 x 3
+        cols = st.columns(4)
+        for j, col in enumerate(cols):
+            m = fila * 4 + j + 1
+            if col.button(MESES[m - 1], key=f"mes_{m}", width="stretch",
+                          type="primary" if sel == m else "secondary"):
+                st.session_state["res_sel"] = m
+                st.rerun()
+    if st.button(f"AÑO {anio} COMPLETO", key="mes_0", width="stretch",
+                 type="primary" if sel == 0 else "secondary"):
+        st.session_state["res_sel"] = 0
+        st.rerun()
+
+    st.divider()
+    if sel == 0:
+        st.subheader(f"Resumen del año {anio}")
+        tarjetas_resumen(resumen_periodo(date(anio, 1, 1), date(anio, 12, 31)))
+        st.subheader("Por mes")
+        df = tabla_resumen([fila_resumen(MESES[m - 1].capitalize(),
+                                         resumen_periodo(date(anio, m, 1), date(anio, m, monthrange(anio, m)[1])))
+                            for m in range(1, 13)])
+        nombre_csv = f"resumen_{anio}.csv"
+    else:
+        ini, fin = date(anio, sel, 1), date(anio, sel, monthrange(anio, sel)[1])
+        st.subheader(f"Resumen de {MESES[sel - 1].capitalize()} {anio}")
+        tarjetas_resumen(resumen_periodo(ini, fin))
+        st.subheader("Por semana")
+        df = tabla_resumen([fila_resumen(et, resumen_periodo(a, b)) for et, a, b in semanas_del_mes(anio, sel)])
+        nombre_csv = f"resumen_{anio}_{sel:02d}.csv"
+    st.dataframe(df, width="stretch", hide_index=True)
+    st.download_button("Descargar esta tabla (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
+                       nombre_csv, "text/csv")
+    if sel != 0:
+        st.subheader("Por producto")
+        pp = tabla_por_producto(str(ini), str(fin))
+        if pp.empty:
+            st.info("Sin producción, despachos ni devoluciones en este mes.")
+        else:
+            st.dataframe(pp, width="stretch", hide_index=True)
+    st.caption("Los registros anulados no se cuentan. Fill rate, recuperación, merma y exactitud se "
+               "calculan con los registros de cada periodo; las semanas van de lunes a domingo.")
+
+
 PAGINAS = {
     "Panel": pag_dashboard,
+    "Resumen": pag_resumen,
     "Catálogos": pag_catalogos,
     "Recepción de leche": pag_recepcion,
     "Pasteurización": pag_pasteurizacion,
     "Producción y mermas": pag_produccion,
     "Pedidos y despachos": pag_despachos,
+    "Pedidos devueltos": pag_devoluciones,
+    "Almacén de producto terminado": pag_almacen_pt,
     "Kardex": pag_kardex,
     "Inventario físico": pag_conteo,
     "Indicadores": pag_indicadores,
