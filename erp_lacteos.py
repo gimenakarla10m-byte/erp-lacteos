@@ -307,6 +307,28 @@ def registrar_pasteurizacion(fecha, lote, litros, temperatura, tiempo_min, hora_
     return resultado["conforme"]
 
 
+def eliminar_proveedor(pid):
+    con = get_conn()
+    try:
+        con.execute("DELETE FROM proveedores WHERE id=?", (pid,))
+        con.commit()
+    except sqlite3.IntegrityError:
+        raise ValueError("Ese proveedor ya tiene recepciones de leche registradas, "
+                         "así que no se puede eliminar.")
+    finally:
+        con.close()
+
+
+def dar_de_baja_operador(oid):
+    """El operador deja de aparecer en las listas, pero conserva su historial."""
+    con = get_conn()
+    try:
+        con.execute("UPDATE operadores SET activo=0 WHERE id=?", (oid,))
+        con.commit()
+    finally:
+        con.close()
+
+
 def actualizar_producto(pid, nombre, tipo, unidad, minimo):
     if not nombre.strip():
         raise ValueError("El nombre es obligatorio.")
@@ -532,7 +554,26 @@ def pag_catalogos():
                     con.commit()
                     con.close()
                 guardar(_addp)
-        st.dataframe(q("SELECT nombre, ruta FROM proveedores"), width="stretch", hide_index=True)
+
+        sql_prov = """SELECT v.id, v.nombre, COALESCE(v.ruta, '') AS ruta, COUNT(r.id) AS recepciones
+                      FROM proveedores v LEFT JOIN recepcion_leche r ON r.proveedor_id = v.id
+                      GROUP BY v.id ORDER BY v.nombre, v.id"""
+        prov = q(sql_prov)
+        if not prov.empty:
+            with st.expander("Eliminar un proveedor"):
+                etiquetas = (prov.nombre + " · ruta: " + prov.ruta.replace("", "(sin ruta)")
+                             + " · " + prov.recepciones.astype(str) + " recepciones")
+                opts = dict(zip(prov.id.tolist(), etiquetas.tolist()))
+                with st.form("f_del_prov"):
+                    sel = st.selectbox("Proveedor a eliminar", list(opts), format_func=opts.get)
+                    ok_ = st.checkbox("Confirmo que quiero eliminarlo")
+                    if st.form_submit_button("Eliminar proveedor"):
+                        if not ok_:
+                            st.error("Marca la casilla de confirmación.")
+                        else:
+                            guardar(eliminar_proveedor, sel, ok="Proveedor eliminado.")
+        prov = q(sql_prov)   # se vuelve a consultar para mostrar la lista ya actualizada
+        st.dataframe(prov.drop(columns="id"), width="stretch", hide_index=True)
     with t3:
         with st.form("f_oper", clear_on_submit=True):
             o1, o2 = st.columns(2)
@@ -547,6 +588,15 @@ def pag_catalogos():
                     con.commit()
                     con.close()
                 guardar(_addo)
+        ops = q("SELECT id, nombre, cargo FROM operadores WHERE activo=1 ORDER BY nombre")
+        if not ops.empty:
+            with st.expander("Dar de baja a un operador"):
+                opts_o = dict(zip(ops.id.tolist(), ops.nombre.tolist()))
+                with st.form("f_del_oper"):
+                    sel_o = st.selectbox("Operador", list(opts_o), format_func=opts_o.get)
+                    if st.form_submit_button("Dar de baja"):
+                        guardar(dar_de_baja_operador, sel_o,
+                                ok="Operador dado de baja (su historial se conserva).")
         st.dataframe(q("SELECT nombre, cargo FROM operadores WHERE activo=1 ORDER BY nombre"),
                      width="stretch", hide_index=True)
 
