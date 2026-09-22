@@ -35,6 +35,8 @@ VERSION_CATALOGO = 2
 INSUMOS_PROCESO = ["Cloruro de calcio", "Cultivo", "Conservante", "Cuajo"]  # cuadro de insumos del control de proceso
 TIENDAS_INICIALES = ["Tienda principal", "Tienda en Baños", "Tienda de la Plaza de Armas",
                      "Tienda de San Martín"]
+META_EXACTITUD = 95     # criterio de investigación (%)
+META_FILL_RATE = 95    # criterio de investigación (%)
 RESULTADO_MASTITIS = ["Negativo", "Positivo"]
 RESULTADO_ANTIBIOTICOS = ["Ausente", "Presente"]
 
@@ -385,9 +387,10 @@ def registrar_recepcion(fecha, proveedor_id, litros, grasa, acidez, densidad, te
             (str(fecha), proveedor_id, litros, grasa, acidez, densidad, temp, int(aprobada), hora,
              n_tanques, n_porongos, procedencia, ph, lactosa, proteina, sng, mastitis, antibioticos,
              agua_l, acept, responsable_id))
+        rec_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
         if aprobada:  # la leche rechazada no ingresa al inventario
             mover(con, fecha, producto_id(con, "MP-LECHE"), "ENTRADA",
-                  "Recepción de leche", acept, documento=f"REC-{fecha}")
+                  "Recepción de leche", acept, documento=f"REC-{rec_id}")
     transaccion(_op)
 
 
@@ -802,26 +805,35 @@ def kardex(producto=None):
     return df
 
 
-def indicadores(desde, hasta, docs_fisicos=0):
-    """Indicadores de la tesis: existencias, exactitud, fill rate y merma."""
+def indicadores(desde, hasta):
+    """Indicadores de la tesis: control de existencias, exactitud, fill rate y suero desechado."""
     d, h = str(desde), str(hasta)
     out = {}
 
-    # 1) Control de existencias: movimientos con documento / documentos físicos
-    con_doc = q("SELECT COUNT(*) n FROM movimientos WHERE fecha BETWEEN ? AND ? "
-                "AND documento IS NOT NULL AND motivo NOT LIKE 'Anulación%'", (d, h)).n[0]
-    out["control_existencias"] = (con_doc / docs_fisicos * 100) if docs_fisicos else None
+    # 1) Control de existencias = movimientos de entrada y salida con un registro que permite
+    #    identificarlos y darles seguimiento (documento, guía o lote) / total de movimientos x 100
+    mv = q("""SELECT COUNT(*) AS total,
+                     COALESCE(SUM(CASE WHEN documento IS NOT NULL AND TRIM(documento) <> '' THEN 1 ELSE 0 END), 0)
+                     AS identificados
+              FROM movimientos WHERE fecha BETWEEN ? AND ? AND motivo NOT LIKE 'Anulación%'""", (d, h))
+    out["control_existencias"] = (mv.identificados[0] / mv.total[0] * 100) if mv.total[0] else None
 
-    # 2) Exactitud: conteos sin diferencia / conteos realizados
-    c = q("SELECT diferencia FROM conteos WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
-    out["exactitud"] = ((c.diferencia.abs() < 1e-9).mean() * 100) if len(c) else None
+    # 2) Exactitud = Σ inventario físico / Σ stock teórico (el registrado en el sistema al contar) x 100
+    #    stock_sistema ya se guarda en cada conteo como entradas de producción/recepción − salidas
+    #    de despacho/consumo hasta ese momento, según los movimientos del Kardex.
+    c = q("SELECT stock_sistema, stock_fisico FROM conteos WHERE fecha BETWEEN ? AND ? AND anulado = 0",
+          (d, h))
+    teorico = c.stock_sistema.sum()
+    out["exactitud"] = (c.stock_fisico.sum() / teorico * 100) if len(c) and teorico else None
+    out["conteos_periodo"] = len(c)
 
     # 3) Fill rate: cantidad despachada / cantidad pedida
     p = q("SELECT SUM(cant_pedida) ped, SUM(cant_despachada) des FROM pedidos "
           "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
     out["fill_rate"] = (p.des[0] / p.ped[0] * 100) if p.ped[0] else None
 
-    # 4) Coeficiente de recuperación de leche = producto obtenido / leche usada x 100
+    # 4) Suero desechado = (suero obtenido - vendido - usado en planta) / suero obtenido x 100
+    #    (además, como dato auxiliar: coeficiente de recuperación de leche)
     pr = q("""SELECT p.nombre, SUM(litros_leche) leche, SUM(cantidad_obtenida) obtenido,
                      SUM(suero_obtenido) suero, SUM(suero_vendido) vendido, SUM(suero_usado) usado
               FROM produccion pr JOIN productos p ON p.id = pr.producto_id
@@ -1640,26 +1652,35 @@ def fmt(v, meta=None):
 
 def pag_indicadores():
     st.header("Indicadores de gestión de inventarios")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     desde = c1.date_input("Desde", date(date.today().year, 1, 1))
     hasta = c2.date_input("Hasta", date.today())
-    docs = c3.number_input("Documentos físicos del periodo (guías, notas)", min_value=0, step=1)
-    r = indicadores(desde, hasta, docs)
+    r = indicadores(desde, hasta)
 
+    st.subheader("Variable dependiente: Gestión de inventarios")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Control de existencias (meta ≥100%)", fmt(r["control_existencias"]))
-    m2.metric("Exactitud del inventario (meta ≥95%)", fmt(r["exactitud"]))
-    m3.metric("Fill rate (meta ≥80%)", fmt(r["fill_rate"]))
-    m4.metric("Recuperación de leche", fmt(r["recuperacion_global"]))
-    n1, n2, n3 = st.columns(3)
-    n3.metric("Tasa de devoluciones", fmt(r["tasa_devoluciones"]))
+    m1.metric("Control de existencias", fmt(r["control_existencias"]),
+              help="Porcentaje de movimientos de entrada y salida que tienen un registro que permite "
+                   "identificarlos y darles seguimiento (documento, guía o lote).")
+    m2.metric(f"Exactitud (criterio ≥{META_EXACTITUD}%)", fmt(r["exactitud"]),
+              help="Suma del inventario físico contado ÷ suma del stock teórico del sistema en el "
+                   f"momento del conteo (basado en {r['conteos_periodo']} conteos del periodo).")
+    m3.metric(f"Fill rate (criterio ≥{META_FILL_RATE}%)", fmt(r["fill_rate"]),
+              help="Cantidad despachada ÷ cantidad pedida por los clientes.")
+    m4.metric("Suero desechado", fmt(r["suero_merma_%"]),
+              help="Suero obtenido que no se vendió ni se usó en la planta ÷ suero obtenido.")
+
+    st.subheader("Otros datos de la planta")
+    n1, n2, n3, n4 = st.columns(4)
     if r["suero_merma_l"] is not None:
-        n1.metric("Merma de suero (L)", f"{r['suero_merma_l']:.1f}  ({fmt(r['suero_merma_%'])})")
-    n2.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']} en el periodo)",
-              fmt(r["pasteurizacion_conforme"]))
+        n1.metric("Suero desechado (L)", f"{r['suero_merma_l']:,.1f}")
+    n2.metric("Recuperación de leche", fmt(r["recuperacion_global"]),
+              help="Producto obtenido ÷ leche usada. Ya no es indicador de la tesis; se conserva como dato.")
+    n3.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']})", fmt(r["pasteurizacion_conforme"]))
+    n4.metric("Tasa de devoluciones", fmt(r["tasa_devoluciones"]))
     if len(r["detalle_produccion"]):
-        st.subheader("Recuperación por producto")
-        st.dataframe(r["detalle_produccion"], width="stretch", hide_index=True)
+        with st.expander("Recuperación de leche por producto"):
+            st.dataframe(r["detalle_produccion"], width="stretch", hide_index=True)
 
 
 # ─────────────────────────── Resumen por semana / mes / año ───────────────────────────
@@ -1673,7 +1694,7 @@ def _suma_por_unidad(tabla, campo, d, h):
 def resumen_periodo(desde, hasta):
     """Todas las cifras de un periodo (los registros anulados no cuentan)."""
     d, h = str(desde), str(hasta)
-    ind = indicadores(desde, hasta, 0)
+    ind = indicadores(desde, hasta)
     leche = q("SELECT COALESCE(SUM(litros), 0) AS v FROM recepcion_leche "
               "WHERE anulado=0 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
     aceptada = q("SELECT COALESCE(SUM(COALESCE(litros_aceptados, litros)), 0) AS v FROM recepcion_leche "
@@ -1686,6 +1707,7 @@ def resumen_periodo(desde, hasta):
         "despachado": _suma_por_unidad("pedidos", "cant_despachada", d, h),
         "devuelto": _suma_por_unidad("devoluciones", "cantidad", d, h),
         "fill_rate": ind["fill_rate"], "recuperacion": ind["recuperacion_global"],
+        "control_existencias": ind["control_existencias"],
         "merma_suero_l": ind["suero_merma_l"], "merma_suero_pct": ind["suero_merma_%"],
         "exactitud": ind["exactitud"], "past_conforme": ind["pasteurizacion_conforme"],
         "pasteurizaciones": ind["pasteurizaciones"], "tasa_devoluciones": ind["tasa_devoluciones"],
@@ -1702,8 +1724,10 @@ def fila_resumen(etiqueta, r):
         "producción_kg": r["producido"].get("kg", 0.0), "producción_L": r["producido"].get("L", 0.0),
         "despachado_kg": r["despachado"].get("kg", 0.0), "despachado_L": r["despachado"].get("L", 0.0),
         "devuelto_kg": r["devuelto"].get("kg", 0.0), "devuelto_L": r["devuelto"].get("L", 0.0),
-        "fill_rate_%": redondear(r["fill_rate"]), "recuperación_%": redondear(r["recuperacion"]),
-        "merma_suero_L": redondear(r["merma_suero_l"]), "exactitud_%": redondear(r["exactitud"]),
+        "control_existencias_%": redondear(r["control_existencias"]),
+        "exactitud_%": redondear(r["exactitud"]), "fill_rate_%": redondear(r["fill_rate"]),
+        "suero_desechado_L": redondear(r["merma_suero_l"]), "suero_desechado_%": redondear(r["merma_suero_pct"]),
+        "recuperación_%": redondear(r["recuperacion"]),
         "pasteurización_conforme_%": redondear(r["past_conforme"]),
     }
 
@@ -1755,12 +1779,12 @@ def tarjetas_resumen(r):
     b2.metric("Despachado", texto_unidades(r["despachado"]))
     b3.metric("Devuelto", texto_unidades(r["devuelto"]))
     c1, c2, c3 = st.columns(3)
-    c1.metric("Fill rate (meta ≥80%)", fmt(r["fill_rate"]))
-    c2.metric("Recuperación de leche", fmt(r["recuperacion"]))
+    c1.metric(f"Fill rate (criterio ≥{META_FILL_RATE}%)", fmt(r["fill_rate"]))
     merma = r["merma_suero_l"]
-    c3.metric("Merma de suero", "s/d" if merma is None else f"{merma:,.1f} L ({fmt(r['merma_suero_pct'])})")
+    c2.metric("Suero desechado", "s/d" if merma is None else f"{fmt(r['merma_suero_pct'])} ({merma:,.1f} L)")
+    c3.metric("Control de existencias", fmt(r["control_existencias"]))
     d1, d2, d3 = st.columns(3)
-    d1.metric("Exactitud del inventario (meta ≥95%)", fmt(r["exactitud"]))
+    d1.metric(f"Exactitud del inventario (criterio ≥{META_EXACTITUD}%)", fmt(r["exactitud"]))
     d2.metric(f"Pasteurizaciones conformes ({r['pasteurizaciones']})", fmt(r["past_conforme"]))
     d3.metric("Tasa de devoluciones", fmt(r["tasa_devoluciones"]))
 
