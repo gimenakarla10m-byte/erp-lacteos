@@ -1408,22 +1408,24 @@ def pag_programacion():
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar programación"):
             guardar(registrar_programacion, f, lote.strip() or None, pid, litros, oper, obs.strip() or None)
+            
     form_anular("prog", q("""SELECT g.id, 'N°' || g.id || ' · ' || g.fecha || ' · ' || p.nombre || ' · ' ||
                                     g.litros_programados || ' L' AS etiqueta
                              FROM programacion g JOIN productos p ON p.id = g.producto_id
                              WHERE g.anulado = 0 ORDER BY g.id DESC LIMIT 100"""), anular_programacion)
+                             
     st.subheader("Programado vs producido")
     st.caption("«Litros usados» son los litros de leche de las producciones registradas ese día para ese producto.")
     st.dataframe(q("""SELECT g.id AS n, g.fecha, g.lote, p.codigo AS codigo_producto, p.nombre AS producto, 
                       o.nombre AS operador_responsable, g.litros_programados, COALESCE(u.usados, 0) AS litros_usados,
                       ROUND(COALESCE(u.usados, 0) * 100.0 / g.litros_programados, 1) AS "cumplimiento_%",
-                      g.observacion, CASE g.anulado WHEN 1 THEN 'ANULADO Y ELIMINADO OFICIALMENTE' ELSE 'Vigente' END AS estado,
-                      g.motivo_anulacion
+                      g.observacion
                       FROM programacion g JOIN productos p ON p.id = g.producto_id
                       LEFT JOIN operadores o ON o.id = g.responsable_id
                       LEFT JOIN (SELECT fecha, producto_id, SUM(litros_leche) AS usados FROM produccion
                                  WHERE anulado = 0 GROUP BY fecha, producto_id) u
                              ON u.fecha = g.fecha AND u.producto_id = g.producto_id
+                      WHERE g.anulado = 0
                       ORDER BY g.fecha DESC, g.id DESC"""),
                  width="stretch", hide_index=True)
 
