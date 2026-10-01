@@ -1647,7 +1647,7 @@ def pag_conteo():
 
 
 def fmt(v, meta=None):
-    return "s/d" if v is None else f"{v:.1f}%"
+    return "0.0%" if v is None else f"{v:.1f}%"
 
 
 def pag_indicadores():
@@ -1781,7 +1781,7 @@ def tarjetas_resumen(r):
     c1, c2, c3 = st.columns(3)
     c1.metric(f"Fill rate (criterio ≥{META_FILL_RATE}%)", fmt(r["fill_rate"]))
     merma = r["merma_suero_l"]
-    c2.metric("Suero desechado", "s/d" if merma is None else f"{fmt(r['merma_suero_pct'])} ({merma:,.1f} L)")
+    c2.metric("Suero desechado", "0.0%" if merma is None else f"{fmt(r['merma_suero_pct'])} ({merma:,.1f} L)")
     c3.metric("Control de existencias", fmt(r["control_existencias"]))
     d1, d2, d3 = st.columns(3)
     d1.metric(f"Exactitud del inventario (criterio ≥{META_EXACTITUD}%)", fmt(r["exactitud"]))
