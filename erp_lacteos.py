@@ -1417,7 +1417,7 @@ def pag_programacion():
     st.dataframe(q("""SELECT g.id AS n, g.fecha, g.lote, p.codigo AS codigo_producto, p.nombre AS producto, 
                       o.nombre AS operador_responsable, g.litros_programados, COALESCE(u.usados, 0) AS litros_usados,
                       ROUND(COALESCE(u.usados, 0) * 100.0 / g.litros_programados, 1) AS "cumplimiento_%",
-                      g.observacion, CASE g.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
+                      g.observacion, CASE g.anulado WHEN 1 THEN 'ANULADO Y ELIMINADO OFICIALMENTE' ELSE 'Vigente' END AS estado,
                       g.motivo_anulacion
                       FROM programacion g JOIN productos p ON p.id = g.producto_id
                       LEFT JOIN operadores o ON o.id = g.responsable_id
