@@ -31,10 +31,14 @@ DESTINO_REINGRESO = "Reingresa al almacén"
 DESTINO_MERMA = "Merma (ya no se puede vender)"
 MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO",
          "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
-VERSION_CATALOGO = 2
+VERSION_CATALOGO = 3
 INSUMOS_PROCESO = ["Cloruro de calcio", "Cultivo", "Conservante", "Cuajo"]
-TIENDAS_INICIALES = ["Tienda principal", "Tienda en Baños", "Tienda de la Plaza de Armas",
-                     "Tienda de San Martín"]
+TIENDAS_INICIALES = ["Tienda principal", "Capuli", "La Fontina", "La Vaca", "San Martín",
+                     "Baños del Inca", "Aeropuerto"]
+PROVEEDORES_INICIALES = [("Huacariz", "Cajamarca"), ("Valle Verde", "Cajamarca"),
+                         ("San José", "Cajamarca"), ("Hierba Buena", "Cajamarca")]
+OPERADORES_INICIALES = ["Saúl Castrejón", "Luis Huaripata", "Freddy Cholán", "Ana Torres",
+                        "Margarita Culqui", "Caroline Ruíz", "Walter Prado", "Guillermo Mantilla"]
 META_EXACTITUD = 95
 META_FILL_RATE = 95
 RESULTADO_MASTITIS = ["Negativo", "Positivo"]
@@ -207,13 +211,19 @@ SEED_PRODUCTOS = [
     ("PT-ACEITUNA", "Aceituna", "Producto terminado", "kg", 0),
     ("PT-BABYSUIZO", "Baby suizo", "Producto terminado", "kg", 0),
     ("PT-TILSIT", "Tilsit", "Producto terminado", "kg", 0),
-    ("PT-YOG", "Yogurt", "Producto terminado", "L", 0),
+    ("PT-YOGFRUT", "Yogurt frutado", "Producto terminado", "L", 0),
+    ("PT-YOGSEMI", "Yogurt semidescremado", "Producto terminado", "L", 0),
+    ("PT-YOGBEB", "Yogurt bebible", "Producto terminado", "L", 0),
+    ("PT-YOGPROB", "Yogurt probiótico", "Producto terminado", "L", 0),
+    ("PT-YOGNAT", "Yogurt natural", "Producto terminado", "L", 0),
     ("PT-NATILLA", "Natilla", "Producto terminado", "kg", 0),
     ("PT-MANJAR", "Manjar", "Producto terminado", "kg", 0),
     ("PT-RIC", "Ricota", "Producto terminado", "kg", 0),
     ("PT-PROVOLONE", "Provolone", "Producto terminado", "kg", 0),
     ("PT-MERMELADA", "Mermelada", "Producto terminado", "kg", 0),
     ("PT-ROCOTO", "Queso con rocoto", "Producto terminado", "kg", 0),
+    ("PT-MIEL", "Miel de caña", "Producto terminado", "L", 0),
+    ("PT-CREMA", "Crema de leche", "Producto terminado", "L", 0),
     ("SB-SUERO", "Suero de leche", "Subproducto", "L", 0),
 ]
 
@@ -284,7 +294,7 @@ def migrar(con):
             con.execute("UPDATE productos SET nombre=? WHERE codigo=?", (nom, cod))
         con.execute("UPDATE productos SET stock_minimo=0 WHERE codigo IN "
                     "('MP-LECHE','MP-CUAJO','IN-SAL','IN-CULT','PT-MOZ','PT-MANT','PT-MANTEQ',"
-                    "'PT-RIC','PT-YOG','SB-SUERO')")
+                    "'PT-RIC','SB-SUERO')")
         con.executemany(
             "INSERT OR IGNORE INTO productos (codigo, nombre, tipo, unidad, stock_minimo) "
             "VALUES (?,?,?,?,?)", SEED_PRODUCTOS)
@@ -294,6 +304,16 @@ def migrar(con):
             if not con.execute("SELECT 1 FROM destinos WHERE nombre = ? COLLATE NOCASE", (nombre,)).fetchone():
                 con.execute("INSERT INTO destinos (nombre, tipo) VALUES (?, 'Tienda')", (nombre,))
         set_meta(con, "destinos_iniciales", 1)
+    if get_meta(con, "proveedores_iniciales") is None:
+        for nombre, ruta in PROVEEDORES_INICIALES:
+            if not con.execute("SELECT 1 FROM proveedores WHERE nombre = ? COLLATE NOCASE", (nombre,)).fetchone():
+                con.execute("INSERT INTO proveedores (nombre, ruta) VALUES (?, ?)", (nombre, ruta))
+        set_meta(con, "proveedores_iniciales", 1)
+    if get_meta(con, "operadores_iniciales") is None:
+        for nombre in OPERADORES_INICIALES:
+            if not con.execute("SELECT 1 FROM operadores WHERE nombre = ? COLLATE NOCASE", (nombre,)).fetchone():
+                con.execute("INSERT INTO operadores (nombre, cargo) VALUES (?, '')", (nombre,))
+        set_meta(con, "operadores_iniciales", 1)
     if get_meta(con, "past_temp_min") is None:
         set_meta(con, "past_temp_min", 63)
         set_meta(con, "past_tiempo_min", 30)
@@ -1745,6 +1765,167 @@ def pag_resumen():
     st.caption("Los registros anulados no se cuentan. Fill rate, recuperación, merma y exactitud se "
                "calculan con los registros de cada periodo; las semanas van de lunes a domingo.")
 
+MARCA_DEMO = "demo_cargada"
+
+def _pid_demo(codigo):
+    con = get_conn()
+    pid = producto_id(con, codigo)
+    con.close()
+    return pid
+
+def datos_ejemplo_ya_cargados():
+    con = get_conn()
+    cargada = get_meta(con, MARCA_DEMO) is not None
+    con.close()
+    return cargada
+
+def borrar_datos_ejemplo():
+    con = get_conn()
+    for tabla in ("movimientos", "produccion_insumos", "trazabilidad", "devoluciones", "pedidos",
+                  "produccion", "recepcion_leche", "pasteurizacion", "conteos", "programacion"):
+        con.execute(f"DELETE FROM {tabla}")
+    con.execute("DELETE FROM meta WHERE clave = ?", (MARCA_DEMO,))
+    con.commit()
+    con.close()
+
+def cargar_datos_ejemplo():
+    """Carga ~15 días de movimientos INVENTADOS (recepción, producción, despachos, etc.),
+    usando el catálogo real (proveedores, operadores, tiendas, productos) ya sembrado."""
+    if datos_ejemplo_ya_cargados():
+        raise ValueError("Los datos de ejemplo ya estaban cargados; no se repite la carga. "
+                         "Si quieres recargarlos, primero bórralos.")
+    con = get_conn()
+    proveedores = [r[0] for r in con.execute(
+        "SELECT id FROM proveedores WHERE nombre IN ('Huacariz','Valle Verde','San José','Hierba Buena') "
+        "ORDER BY id")]
+    operadores = [r[0] for r in con.execute(
+        "SELECT id FROM operadores WHERE nombre IN "
+        "('Saúl Castrejón','Luis Huaripata','Freddy Cholán','Ana Torres',"
+        "'Margarita Culqui','Caroline Ruíz','Walter Prado','Guillermo Mantilla') ORDER BY id")]
+    destinos = [r[0] for r in con.execute("SELECT id FROM destinos ORDER BY id")]
+    con.close()
+    if len(proveedores) < 4 or len(operadores) < 8 or not destinos:
+        raise ValueError("Falta el catálogo real (proveedores, operadores o tiendas). "
+                         "Asegúrate de tener la última versión del sistema.")
+
+    prov_huacariz, prov_valle, prov_sanjose, prov_hierba = proveedores
+    op_jorge = operadores[-1]
+    productos_demo = ["PT-MOZ", "PT-EDAM", "PT-ANDINO", "PT-YOGFRUT", "PT-MANTEQ", "PT-MIEL", "PT-CREMA"]
+    insumos_ejemplo = [
+        {"insumo": "Cuajo", "cantidad_g": 5, "marca": "Chr Hansen (ejemplo)", "lote": "L-77",
+         "fecha_prod": "01/26", "fecha_venc": "01/27"},
+        {"insumo": "Cultivo", "cantidad_g": 2, "marca": "Danisco (ejemplo)", "lote": "C-12",
+         "fecha_prod": "02/26", "fecha_venc": "02/27"},
+    ]
+    inicio = date.today() - timedelta(days=21)
+    lotes_creados, despachos_creados = [], []
+    f = inicio
+    dia_n = 0
+    while dia_n < 15:
+        if f.weekday() == 6:
+            f += timedelta(days=1)
+            continue
+        dia_n += 1
+        proveedor = [prov_huacariz, prov_valle, prov_sanjose, prov_hierba][dia_n % 4]
+        litros_recibidos = 500 + (dia_n % 5) * 40
+        operador_recepcion = operadores[dia_n % len(operadores)]
+        producto_dia = productos_demo[dia_n % len(productos_demo)]
+        lote = f"L{f.strftime('%m%d')}"
+
+        registrar_programacion(f, lote, _pid_demo(producto_dia), litros_recibidos - 50,
+                               operadores[dia_n % len(operadores)], "Programación de ejemplo")
+
+        mastitis = "Positivo" if dia_n == 7 else "Negativo"
+        registrar_recepcion(
+            f, proveedor, litros_recibidos, grasa=3.5 + (dia_n % 3) * 0.1, acidez=16 + dia_n % 4,
+            densidad=1.029, temp=9 + dia_n % 3, aprobada=True,
+            hora="06:30", n_tanques=1, n_porongos=4 + dia_n % 3, procedencia="Cajamarca",
+            ph=6.6 + (dia_n % 3) * 0.05, lactosa=4.6, proteina=3.1, sng=8.6,
+            mastitis=mastitis, antibioticos="Ausente", agua_l=10, responsable_id=operador_recepcion)
+        if dia_n == 10:
+            registrar_recepcion(f, prov_hierba, 80, grasa=3.0, acidez=28, densidad=1.025, temp=14,
+                                aprobada=False, antibioticos="Ausente", responsable_id=operador_recepcion)
+
+        temp_past = 60 if dia_n == 5 else 65
+        registrar_pasteurizacion(f, lote, litros_recibidos - 50, temp_past, 30, "07:00",
+                                 operadores[dia_n % len(operadores)], producto_id_=_pid_demo(producto_dia))
+
+        obtenida = round((litros_recibidos - 50) * 0.10, 1)
+        suero = round((litros_recibidos - 50) * 0.84, 0)
+        vendido, usado = round(suero * 0.8), round(suero * 0.15)
+        operador_prod = operadores[(dia_n + 1) % len(operadores)]
+        registrar_produccion(f, lote, _pid_demo(producto_dia), litros_recibidos - 50, obtenida,
+                             suero, vendido, usado, operador_prod,
+                             insumos=insumos_ejemplo if dia_n % 3 == 0 else None)
+        lotes_creados.append(lote)
+
+        if dia_n % 2 == 0:
+            destino = destinos[dia_n % len(destinos)]
+            pedida = max(obtenida - 2, 1)
+            registrar_despacho(f, "", _pid_demo(producto_dia), pedida, pedida, f"G-{dia_n:03d}",
+                               destino_id=destino, responsable_id=op_jorge)
+            con = get_conn()
+            desp_id = con.execute("SELECT id FROM pedidos ORDER BY id DESC LIMIT 1").fetchone()[0]
+            con.close()
+            despachos_creados.append((desp_id, _pid_demo(producto_dia)))
+
+        f += timedelta(days=1)
+
+    for i, lote in enumerate(lotes_creados[:10]):
+        con = get_conn()
+        row = con.execute("SELECT id, fecha_produccion FROM trazabilidad WHERE lote=?", (lote,)).fetchone()
+        con.close()
+        if not row:
+            continue
+        traz_id, f_prod = row
+        f_prod = date.fromisoformat(f_prod)
+        destino_tienda = destinos[i % len(destinos)]
+        actualizar_trazabilidad(
+            traz_id, fecha_empaque=f_prod + timedelta(days=1), fecha_envasado=f_prod + timedelta(days=1),
+            fecha_maduracion=f_prod + timedelta(days=2) if i % 2 == 0 else None,
+            fecha_salida=f_prod + timedelta(days=3), destino_id=destino_tienda, destino_final_id=destino_tienda,
+            observacion="Trazabilidad de ejemplo")
+
+    if len(despachos_creados) >= 2:
+        d1, p1 = despachos_creados[0]
+        registrar_devolucion(inicio + timedelta(days=4), "", p1, 1, "Producto en mal estado",
+                             DESTINO_REINGRESO, despacho_id=d1, documento="DEV-001", responsable_id=op_jorge)
+        d2, p2 = despachos_creados[1]
+        registrar_devolucion(inicio + timedelta(days=8), "", p2, 1, "Producto vencido",
+                             DESTINO_MERMA, despacho_id=d2, documento="DEV-002", responsable_id=op_jorge)
+
+    stock = stock_actual()
+    moz = stock[stock.codigo == "PT-MOZ"]
+    if not moz.empty and moz.stock.iloc[0] > 0:
+        registrar_conteo(inicio + timedelta(days=14), _pid_demo("PT-MOZ"),
+                         round(moz.stock.iloc[0] * 0.95, 1), ajustar=True)
+
+    con = get_conn()
+    set_meta(con, MARCA_DEMO, "1")
+    con.commit()
+    con.close()
+
+
+def pag_datos_ejemplo():
+    st.header("Datos de ejemplo (demo)")
+    st.caption("Carga ~15 días de movimientos INVENTADOS (recepción, producción, despachos, etc.) usando "
+               "el catálogo real (proveedores, operadores, tiendas, productos), para mostrar el sistema "
+               "ya funcionando. Los nombres de proveedores y operadores sí son los reales; las cantidades "
+               "y fechas de los movimientos son inventadas.")
+    if datos_ejemplo_ya_cargados():
+        st.info("Los datos de ejemplo ya están cargados.")
+        if st.button("Borrar datos de ejemplo"):
+            borrar_datos_ejemplo()
+            st.success("Datos de ejemplo borrados. Recarga la página para verlo vacío.")
+    else:
+        if st.button("Cargar datos de ejemplo"):
+            try:
+                cargar_datos_ejemplo()
+                st.success("Listo. Se cargaron 15 días de datos de ejemplo. Ve al Panel o al Resumen para verlos.")
+            except ValueError as ex:
+                st.error(str(ex))
+
+
 PAGINAS = {
     "Panel": pag_dashboard,
     "Resumen": pag_resumen,
@@ -1760,6 +1941,7 @@ PAGINAS = {
     "Kardex": pag_kardex,
     "Inventario físico": pag_conteo,
     "Indicadores": pag_indicadores,
+    "Datos de ejemplo (demo)": pag_datos_ejemplo,
 }
 
 def main():
