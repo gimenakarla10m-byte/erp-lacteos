@@ -278,6 +278,7 @@ def migrar(con):
         ("recepcion_leche", "responsable_id", "INTEGER REFERENCES operadores(id)"),
         ("pasteurizacion", "producto_id", "INTEGER REFERENCES productos(id)"),
         ("pedidos", "destino_id", "INTEGER REFERENCES destinos(id)"),
+        ("pedidos", "lote", "TEXT"),
         ("pedidos", "responsable_envio_id", "INTEGER REFERENCES operadores(id)"),
         ("devoluciones", "destino_id", "INTEGER REFERENCES destinos(id)"),
         ("devoluciones", "responsable_id", "INTEGER REFERENCES operadores(id)"),
@@ -681,7 +682,7 @@ def _nombre_destino(con, destino_id):
     return fila[0]
 
 def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento, destino_id=None,
-                       responsable_id=None):
+                       responsable_id=None, lote=None):
     if despachada > pedida:
         raise ValueError("No se puede despachar más de lo pedido.")
     if destino_id is None and not (cliente or "").strip():
@@ -690,8 +691,8 @@ def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento, desti
         cli = _nombre_destino(con, destino_id) if destino_id is not None else cliente
         con.execute(
             "INSERT INTO pedidos (fecha, cliente, producto_id, cant_pedida, cant_despachada, documento, "
-            "destino_id, responsable_envio_id) VALUES (?,?,?,?,?,?,?,?)",
-            (str(fecha), cli, pid, pedida, despachada, documento, destino_id, responsable_id))
+            "destino_id, responsable_envio_id, lote) VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(fecha), cli, pid, pedida, despachada, documento, destino_id, responsable_id, lote))
         if despachada > 0:
             mover(con, fecha, pid, "SALIDA", "Despacho a cliente", despachada, documento, cli)
     transaccion(_op)
@@ -1334,12 +1335,27 @@ def pag_produccion():
 
 def pag_despachos():
     st.header("Pedidos y despachos")
+    pid_sel = st.selectbox("Producto a despachar", [None] + list(
+        dict(zip(stock_actual()[stock_actual().tipo == "Producto terminado"].id,
+                 stock_actual()[stock_actual().tipo == "Producto terminado"].nombre))),
+        format_func=lambda i: "Elige un producto para ver sus lotes" if i is None else
+        dict(zip(stock_actual().id, stock_actual().nombre)).get(i, ""), key="desp_pid_lote")
+    lotes_df = q("""SELECT pr.id, 'Lote ' || pr.lote || ' · producido ' || pr.fecha || ' · ' ||
+                           COALESCE(o.nombre, 's/operador') || ' · ' || pr.cantidad_obtenida || ' obtenidos'
+                           AS etiqueta, pr.lote
+                    FROM produccion pr LEFT JOIN operadores o ON o.id = pr.operador_id
+                    WHERE pr.anulado = 0 AND pr.producto_id = ? ORDER BY pr.fecha DESC, pr.id DESC
+                    LIMIT 100""", (pid_sel,)) if pid_sel else q("SELECT 1 WHERE 0")
+    opts_lote = dict(zip(lotes_df.id.tolist(), lotes_df.etiqueta.tolist())) if not lotes_df.empty else {}
     with st.form("f_desp", clear_on_submit=True):
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha", date.today())
         destino = pick_destino("Tienda de destino")
         cliente = c2.text_input("Cliente (si no es una tienda)")
-        pid = pick_producto("Producto", ["Producto terminado"])
+        pid = pick_producto("Producto", ["Producto terminado"], key="desp_pid_form")
+        lote_id = st.selectbox(
+            "Lote despachado (opcional, elige arriba el producto para ver sus lotes)",
+            [None] + list(opts_lote), format_func=lambda i: opts_lote.get(i, "(sin lote específico)"))
         c3, c4, c5 = st.columns(3)
         pedida = c3.number_input("Cantidad pedida", min_value=0.0, step=1.0)
         desp = c4.number_input("Cantidad despachada", min_value=0.0, step=1.0)
@@ -1348,20 +1364,28 @@ def pag_despachos():
         if st.form_submit_button("Registrar despacho"):
             if pedida <= 0:
                 st.error("La cantidad pedida es obligatoria.")
+            elif pid != pid_sel and lote_id is not None:
+                st.error("El producto elegido abajo no es el mismo del lote seleccionado arriba. "
+                         "Vuelve a elegir el producto arriba para actualizar la lista de lotes.")
             else:
+                lote_txt = opts_lote.get(lote_id) and lotes_df.set_index("id").loc[lote_id, "lote"]
                 guardar(registrar_despacho, f, cliente.strip(), pid, pedida, desp, doc.strip() or None,
-                        destino, resp)
+                        destino, resp, lote_txt)
     form_anular("desp", q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' ||
                                     p.nombre || ' · ' || d.cant_despachada AS etiqueta
                              FROM pedidos d JOIN productos p ON p.id = d.producto_id
                              WHERE d.anulado = 0 ORDER BY d.id DESC LIMIT 100"""), anular_despacho)
-    st.dataframe(q("""SELECT d.id AS n, d.fecha, d.cliente, p.nombre AS producto, d.cant_pedida,
-                      d.cant_despachada, ROUND(d.cant_despachada * 100.0 / d.cant_pedida, 1) AS "fill_rate_%",
+    st.dataframe(q("""SELECT d.id AS n, d.fecha, d.cliente, p.nombre AS producto, d.lote,
+                      op_prod.nombre AS quien_produjo_el_lote,
+                      d.cant_pedida, d.cant_despachada,
+                      ROUND(d.cant_despachada * 100.0 / d.cant_pedida, 1) AS "fill_rate_%",
                       d.documento, o.nombre AS responsable_envio,
                       CASE d.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
                       d.motivo_anulacion
                       FROM pedidos d JOIN productos p ON p.id = d.producto_id
                       LEFT JOIN operadores o ON o.id = d.responsable_envio_id
+                      LEFT JOIN produccion pr ON pr.lote = d.lote AND pr.producto_id = d.producto_id
+                      LEFT JOIN operadores op_prod ON op_prod.id = pr.operador_id
                       ORDER BY d.fecha DESC, d.id DESC"""),
                  width="stretch", hide_index=True)
 
@@ -1375,7 +1399,8 @@ def pag_devoluciones():
     with st.form("f_dev", clear_on_submit=True):
         origen = st.selectbox("Despacho de origen (opcional)", [None] + list(opts_d),
                               format_func=lambda i: opts_d.get(i, "(sin despacho de origen)"))
-        st.caption("Si eliges un despacho, se identificará automáticamente el operador que produjo el lote.")
+        st.caption("Si eliges un despacho que tenía un lote asociado, se identificará automáticamente el "
+                   "operador que produjo ese lote. Si el despacho no tenía lote, no se podrá identificar.")
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha de devolución", date.today())
         with c2:
@@ -1399,20 +1424,20 @@ def pag_devoluciones():
                                    p.nombre || ' · ' || dv.cantidad AS etiqueta
                             FROM devoluciones dv JOIN productos p ON p.id = dv.producto_id
                             WHERE dv.anulado = 0 ORDER BY dv.id DESC LIMIT 100"""), anular_devolucion)
-    st.dataframe(q("""SELECT dv.id AS n, dv.fecha, dv.cliente, p.codigo AS codigo_prod, p.nombre AS producto, 
-                      dv.cantidad, dv.motivo, dv.destino AS destino_producto, 
+    st.dataframe(q("""SELECT dv.id AS n, dv.fecha, dv.cliente, p.codigo AS codigo_prod, p.nombre AS producto,
+                      ped.lote AS lote_despachado,
+                      dv.cantidad, dv.motivo, dv.destino AS destino_producto,
                       op_prod.nombre AS operador_que_produjo,
                       op_rec.nombre AS responsable_recepcion,
                       dv.documento, dv.observacion,
                       CASE dv.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
                       dv.motivo_anulacion
-                      FROM devoluciones dv 
+                      FROM devoluciones dv
                       JOIN productos p ON p.id = dv.producto_id
                       LEFT JOIN operadores op_rec ON op_rec.id = dv.responsable_id
                       LEFT JOIN pedidos ped ON ped.id = dv.despacho_id
-                      LEFT JOIN produccion pr ON (pr.producto_id = dv.producto_id AND pr.fecha <= dv.fecha)
+                      LEFT JOIN produccion pr ON pr.lote = ped.lote AND pr.producto_id = dv.producto_id
                       LEFT JOIN operadores op_prod ON op_prod.id = pr.operador_id
-                      GROUP BY dv.id
                       ORDER BY dv.fecha DESC, dv.id DESC"""),
                  width="stretch", hide_index=True)
 
@@ -1657,14 +1682,15 @@ def tabla_resumen(filas):
             df = df.drop(columns=col)
     return df
 
-def semanas_del_mes(anio, mes):
-    """Semanas de lunes a domingo, recortadas al mes."""
-    ultimo = date(anio, mes, monthrange(anio, mes)[1])
-    ini, n, out = date(anio, mes, 1), 1, []
-    while ini <= ultimo:
-        fin = min(ini + timedelta(days=6 - ini.weekday()), ultimo)
-        out.append((f"Semana {n} ({ini:%d/%m} – {fin:%d/%m})", ini, fin))
-        ini, n = fin + timedelta(days=1), n + 1
+DIAS_SEMANA = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+
+def dias_del_mes(anio, mes):
+    """Un renglón por cada día del mes, porque la producción se registra día a día."""
+    ultimo = monthrange(anio, mes)[1]
+    out = []
+    for d in range(1, ultimo + 1):
+        f = date(anio, mes, d)
+        out.append((f"{f:%d/%m} ({DIAS_SEMANA[f.weekday()]})", f, f))
     return out
 
 def tabla_por_producto(d, h):
@@ -1749,8 +1775,8 @@ def pag_resumen():
         ini, fin = date(anio, sel, 1), date(anio, sel, monthrange(anio, sel)[1])
         st.subheader(f"Resumen de {MESES[sel - 1].capitalize()} {anio}")
         tarjetas_resumen(resumen_periodo(ini, fin))
-        st.subheader("Por semana")
-        df = tabla_resumen([fila_resumen(et, resumen_periodo(a, b)) for et, a, b in semanas_del_mes(anio, sel)])
+        st.subheader("Por día")
+        df = tabla_resumen([fila_resumen(et, resumen_periodo(a, b)) for et, a, b in dias_del_mes(anio, sel)])
         nombre_csv = f"resumen_{anio}_{sel:02d}.csv"
     st.dataframe(df, width="stretch", hide_index=True)
     st.download_button("Descargar esta tabla (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
@@ -1863,7 +1889,7 @@ def cargar_datos_ejemplo():
             destino = destinos[dia_n % len(destinos)]
             pedida = max(obtenida - 2, 1)
             registrar_despacho(f, "", _pid_demo(producto_dia), pedida, pedida, f"G-{dia_n:03d}",
-                               destino_id=destino, responsable_id=op_jorge)
+                               destino_id=destino, responsable_id=op_jorge, lote=lote)
             con = get_conn()
             desp_id = con.execute("SELECT id FROM pedidos ORDER BY id DESC LIMIT 1").fetchone()[0]
             con.close()
