@@ -151,6 +151,19 @@ CREATE TABLE IF NOT EXISTS programacion (
     anulado INTEGER NOT NULL DEFAULT 0,
     motivo_anulacion TEXT
 );
+CREATE TABLE IF NOT EXISTS salida_planta (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fecha TEXT NOT NULL,
+    lote TEXT NOT NULL,
+    producto_id INTEGER NOT NULL REFERENCES productos(id),
+    cantidad REAL NOT NULL,
+    unidades INTEGER,
+    n_jabas INTEGER,
+    documento TEXT,
+    observacion TEXT,
+    anulado INTEGER NOT NULL DEFAULT 0,
+    motivo_anulacion TEXT
+);
 CREATE TABLE IF NOT EXISTS produccion_insumos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     produccion_id INTEGER NOT NULL REFERENCES produccion(id),
@@ -171,6 +184,7 @@ CREATE TABLE IF NOT EXISTS trazabilidad (
     fecha_empaque TEXT,
     fecha_envasado TEXT,
     fecha_maduracion TEXT,
+    fecha_maduracion_empaque TEXT,
     fecha_salida TEXT,
     destino_id INTEGER REFERENCES destinos(id),
     destino_final_id INTEGER REFERENCES destinos(id),
@@ -279,6 +293,7 @@ def migrar(con):
         ("pasteurizacion", "producto_id", "INTEGER REFERENCES productos(id)"),
         ("pedidos", "destino_id", "INTEGER REFERENCES destinos(id)"),
         ("pedidos", "lote", "TEXT"),
+        ("trazabilidad", "fecha_maduracion_empaque", "TEXT"),
         ("pedidos", "responsable_envio_id", "INTEGER REFERENCES operadores(id)"),
         ("devoluciones", "destino_id", "INTEGER REFERENCES destinos(id)"),
         ("devoluciones", "responsable_id", "INTEGER REFERENCES operadores(id)"),
@@ -397,18 +412,25 @@ def registrar_recepcion(fecha, proveedor_id, litros, grasa, acidez, densidad, te
                   "Recepción de leche", acept, documento=f"REC-{rec_id}")
     transaccion(_op)
 
-def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s_usado,
+def registrar_produccion(fecha, lote, pid, litros, suero, s_vendido, s_usado,
                          operador_id=None, insumos=None):
-    if obtenida <= 0:
-        raise ValueError("La cantidad obtenida debe ser mayor que cero.")
     if s_vendido + s_usado > suero + 1e-9:
         raise ValueError("Suero vendido + usado no puede superar el suero obtenido.")
+    if not (lote or "").strip():
+        raise ValueError("El lote es obligatorio.")
     def _op(con):
+        existe = con.execute(
+            "SELECT 1 FROM produccion WHERE lote = ? COLLATE NOCASE AND producto_id = ? AND anulado = 0",
+            (lote, pid)).fetchone()
+        if existe:
+            raise ValueError(f"Ya existe una producción con el lote «{lote}» para este producto. "
+                             "Usa un lote distinto (por ejemplo, agrega -1, -2 si hiciste más de un "
+                             "lote del mismo producto el mismo día).")
         con.execute(
             "INSERT INTO produccion (fecha, lote, producto_id, litros_leche, cantidad_obtenida, "
             "suero_obtenido, suero_vendido, suero_usado, operador_id, merma_en_kardex) "
-            "VALUES (?,?,?,?,?,?,?,?,?,1)",
-            (str(fecha), lote, pid, litros, obtenida, suero, s_vendido, s_usado, operador_id))
+            "VALUES (?,?,?,?,0,?,?,?,?,1)",
+            (str(fecha), lote, pid, litros, suero, s_vendido, s_usado, operador_id))
         prod_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
         con.execute("INSERT INTO trazabilidad (produccion_id, lote, producto_id, responsable_id, "
                     "fecha_produccion) VALUES (?,?,?,?,?)", (prod_id, lote, pid, operador_id, str(fecha)))
@@ -423,7 +445,8 @@ def registrar_produccion(fecha, lote, pid, litros, obtenida, suero, s_vendido, s
         leche, suero_id = producto_id(con, "MP-LECHE"), producto_id(con, "SB-SUERO")
         if litros > 0:
             mover(con, fecha, leche, "SALIDA", "Consumo en producción", litros, lote)
-        mover(con, fecha, pid, "ENTRADA", "Producción terminada", obtenida, lote)
+        # El producto terminado NO entra al Kardex aquí: todavía no se pesa ni se cuenta.
+        # Entra cuando se registra su «Salida de planta» (peso, unidades y jabas reales).
         if suero > 0:
             mover(con, fecha, suero_id, "ENTRADA", "Suero de producción", suero, lote)
         if s_vendido > 0:
@@ -487,6 +510,11 @@ def anular_recepcion(rid, motivo):
 
 def anular_produccion(rid, motivo):
     def _op(con):
+        lote, pid0 = con.execute("SELECT lote, producto_id FROM produccion WHERE id=?", (rid,)).fetchone()
+        if con.execute("SELECT 1 FROM salida_planta WHERE lote = ? COLLATE NOCASE AND producto_id = ? "
+                       "AND anulado = 0", (lote, pid0)).fetchone():
+            raise ValueError("Ese lote ya tiene registrada su salida de planta: anula primero esa "
+                             "salida de planta.")
         _marcar_anulado(con, "produccion", rid, motivo)
         con.execute("UPDATE trazabilidad SET anulado=1, motivo_anulacion=? WHERE produccion_id=?",
                     (motivo, rid))
@@ -506,7 +534,8 @@ def anular_produccion(rid, motivo):
             mover(con, hoy, suero_id, "ENTRADA", mot, merma, doc, motivo)
         if suero > 0:
             mover(con, hoy, suero_id, "SALIDA", mot, suero, doc, motivo)
-        mover(con, hoy, pid, "SALIDA", mot, obtenida, doc, motivo)
+        if obtenida > 1e-9:  # dato antiguo (versiones previas sí movían stock aquí)
+            mover(con, hoy, pid, "SALIDA", mot, obtenida, doc, motivo)
     _transaccion_anulacion(_op)
 
 def anular_devolucion(rid, motivo):
@@ -555,12 +584,47 @@ def registrar_programacion(fecha, lote, pid, litros, responsable_id=None, observ
 def anular_programacion(rid, motivo):
     transaccion(lambda con: _marcar_anulado(con, "programacion", rid, motivo))
 
-def actualizar_trazabilidad(rid, fecha_empaque=None, fecha_envasado=None, fecha_maduracion=None,
-                            fecha_salida=None, destino_id=None, destino_final_id=None, observacion=None):
-    campos = {"fecha_empaque": fecha_empaque, "fecha_envasado": fecha_envasado,
-              "fecha_maduracion": fecha_maduracion, "fecha_salida": fecha_salida,
-              "destino_id": destino_id, "destino_final_id": destino_final_id,
-              "observacion": observacion}
+def registrar_salida_planta(fecha, lote, pid, cantidad, unidades=None, n_jabas=None,
+                            documento=None, observacion=None):
+    """Es aquí donde el producto se pesa y se cuenta de verdad, y entra al Kardex con esa cifra real."""
+    if cantidad <= 0:
+        raise ValueError("La cantidad (peso) debe ser mayor que cero.")
+    if not (lote or "").strip():
+        raise ValueError("Elige el lote.")
+    def _op(con):
+        prod = con.execute(
+            "SELECT 1 FROM produccion WHERE lote = ? COLLATE NOCASE AND producto_id = ? AND anulado = 0",
+            (lote, pid)).fetchone()
+        if not prod:
+            raise ValueError("No se encontró una producción vigente con ese lote para este producto.")
+        ya = con.execute(
+            "SELECT 1 FROM salida_planta WHERE lote = ? COLLATE NOCASE AND producto_id = ? AND anulado = 0",
+            (lote, pid)).fetchone()
+        if ya:
+            raise ValueError(f"El lote «{lote}» ya tiene registrada su salida de planta.")
+        con.execute(
+            "INSERT INTO salida_planta (fecha, lote, producto_id, cantidad, unidades, n_jabas, "
+            "documento, observacion) VALUES (?,?,?,?,?,?,?,?)",
+            (str(fecha), lote, pid, cantidad, unidades or None, n_jabas or None, documento, observacion))
+        mover(con, fecha, pid, "ENTRADA", "Salida de planta", cantidad, documento or lote, lote)
+    transaccion(_op)
+
+def anular_salida_planta(rid, motivo):
+    def _op(con):
+        _marcar_anulado(con, "salida_planta", rid, motivo)
+        pid, cantidad, lote = con.execute(
+            "SELECT producto_id, cantidad, lote FROM salida_planta WHERE id=?", (rid,)).fetchone()
+        mover(con, date.today(), pid, "SALIDA", "Anulación de salida de planta", cantidad,
+              f"ANUL-SAL-{rid}", motivo)
+    _transaccion_anulacion(_op)
+
+def actualizar_trazabilidad(rid, fecha_maduracion=None, fecha_empaque=None, fecha_envasado=None,
+                            fecha_maduracion_empaque=None, fecha_salida=None, destino_id=None,
+                            destino_final_id=None, observacion=None):
+    campos = {"fecha_maduracion": fecha_maduracion, "fecha_empaque": fecha_empaque,
+              "fecha_envasado": fecha_envasado, "fecha_maduracion_empaque": fecha_maduracion_empaque,
+              "fecha_salida": fecha_salida, "destino_id": destino_id,
+              "destino_final_id": destino_final_id, "observacion": observacion}
     campos = {k: (str(v) if k.startswith("fecha") else v) for k, v in campos.items() if v not in (None, "")}
     if not campos:
         raise ValueError("No llenaste ninguna fecha ni el destino.")
@@ -787,9 +851,11 @@ def indicadores(desde, hasta):
           "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
     out["fill_rate"] = (p.des[0] / p.ped[0] * 100) if p.ped[0] else None
 
-    pr = q("""SELECT p.nombre, SUM(litros_leche) leche, SUM(cantidad_obtenida) obtenido,
-                     SUM(suero_obtenido) suero, SUM(suero_vendido) vendido, SUM(suero_usado) usado
+    pr = q("""SELECT p.nombre, SUM(pr.litros_leche) leche, SUM(COALESCE(sp.cantidad, 0)) obtenido,
+                     SUM(pr.suero_obtenido) suero, SUM(pr.suero_vendido) vendido, SUM(pr.suero_usado) usado
               FROM produccion pr JOIN productos p ON p.id = pr.producto_id
+              LEFT JOIN salida_planta sp ON sp.lote = pr.lote COLLATE NOCASE AND sp.producto_id = pr.producto_id
+                                         AND sp.anulado = 0
               WHERE pr.fecha BETWEEN ? AND ? AND pr.litros_leche > 0 AND pr.anulado = 0 GROUP BY p.nombre""", (d, h))
     if len(pr):
         pr["recuperacion_%"] = pr.obtenido / pr.leche * 100
@@ -1266,16 +1332,16 @@ def pag_pasteurizacion():
 
 def pag_produccion():
     st.header("Producción y mermas")
+    st.caption("Aquí se registra el proceso del día (leche usada, suero, insumos). El peso y las unidades "
+               "del producto se registran después, cuando esté listo, en «Salida de planta».")
     with st.form("f_prod_reg", clear_on_submit=True):
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha", date.today())
         lote = c2.text_input("Lote")
         pid = pick_producto("Producto elaborado", ["Producto terminado"])
         oper = pick_operador("Operador (opcional)", obligatorio=False)
-        c3, c4 = st.columns(2)
-        litros = c3.number_input("Litros de leche usados (0 si el producto no lleva leche)",
+        litros = st.number_input("Litros de leche usados (0 si el producto no lleva leche)",
                                  min_value=0.0, step=10.0)
-        obtenida = c4.number_input("Cantidad obtenida (kg o L)", min_value=0.0, step=1.0)
         st.caption("Suero: recibido → vendido / usado → la diferencia es la merma.")
         s1, s2, s3 = st.columns(3)
         suero = s1.number_input("Suero obtenido (L)", min_value=0.0, step=10.0)
@@ -1309,20 +1375,23 @@ def pag_produccion():
                 st.error("El lote es obligatorio.")
             else:
                 guardar(lambda *a: registrar_produccion(*a, insumos=insumos), f, lote.strip(), pid, litros,
-                        obtenida, suero, vendido, usado, oper)
+                        suero, vendido, usado, oper)
     form_anular("prod", q("""SELECT pr.id, 'N°' || pr.id || ' · ' || pr.fecha || ' · lote ' || pr.lote || ' · ' ||
-                                    p.nombre || ' · ' || pr.cantidad_obtenida AS etiqueta
+                                    p.nombre AS etiqueta
                              FROM produccion pr JOIN productos p ON p.id = pr.producto_id
                              WHERE pr.anulado = 0 ORDER BY pr.id DESC LIMIT 100"""), anular_produccion)
     df = q("""SELECT pr.id AS n, pr.fecha, pr.lote, p.nombre AS producto, o.nombre AS operador,
-                     pr.litros_leche, pr.cantidad_obtenida,
-                     ROUND(pr.cantidad_obtenida * 100.0 / pr.litros_leche, 2) AS "recuperación_%",
+                     pr.litros_leche,
+                     sp.cantidad AS cantidad_salida_planta,
+                     ROUND(sp.cantidad * 100.0 / pr.litros_leche, 2) AS "recuperación_%",
                      pr.suero_obtenido, pr.suero_vendido, pr.suero_usado,
                      pr.suero_obtenido - pr.suero_vendido - pr.suero_usado AS merma_suero_L,
                      CASE pr.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
                      pr.motivo_anulacion
               FROM produccion pr JOIN productos p ON p.id = pr.producto_id
               LEFT JOIN operadores o ON o.id = pr.operador_id
+              LEFT JOIN salida_planta sp ON sp.lote = pr.lote AND sp.producto_id = pr.producto_id
+                                         AND sp.anulado = 0
               ORDER BY pr.fecha DESC, pr.id DESC""")
     st.dataframe(df, width="stretch", hide_index=True)
     with st.expander("Insumos usados por lote"):
@@ -1333,6 +1402,58 @@ def pag_produccion():
                           WHERE pr.anulado = 0 ORDER BY pr.fecha DESC, pr.id DESC, i.id"""),
                      width="stretch", hide_index=True)
 
+def pag_salida_planta():
+    st.header("Salida de planta")
+    st.caption("Aquí es donde el producto se pesa y se cuenta de verdad. En cuanto lo registras, entra "
+               "al Kardex con esa cantidad real.")
+    pid_sel = st.selectbox(
+        "Producto", [None] + list(dict(zip(stock_actual()[stock_actual().tipo == "Producto terminado"].id,
+                                           stock_actual()[stock_actual().tipo == "Producto terminado"].nombre))),
+        format_func=lambda i: "Elige un producto para ver sus lotes pendientes" if i is None else
+        dict(zip(stock_actual().id, stock_actual().nombre)).get(i, ""), key="sal_pid_sel")
+    lotes_df = q("""SELECT pr.lote, pr.fecha, pr.litros_leche, o.nombre AS operador
+                    FROM produccion pr LEFT JOIN operadores o ON o.id = pr.operador_id
+                    WHERE pr.anulado = 0 AND pr.producto_id = ?
+                      AND NOT EXISTS (SELECT 1 FROM salida_planta sp WHERE sp.lote = pr.lote COLLATE NOCASE
+                                      AND sp.producto_id = pr.producto_id AND sp.anulado = 0)
+                    ORDER BY pr.fecha DESC, pr.id DESC LIMIT 100""", (pid_sel,)) if pid_sel else q("SELECT 1 WHERE 0")
+    if pid_sel and lotes_df.empty:
+        st.info("Ese producto no tiene lotes pendientes de pesar (o ya se les registró su salida de planta).")
+    opts_lote = dict(zip(lotes_df.lote.tolist(),
+                         (lotes_df.lote + " · producido " + lotes_df.fecha + " · " +
+                          lotes_df.operador.fillna("s/operador") + " · " +
+                          lotes_df.litros_leche.astype(str) + " L de leche").tolist())) if not lotes_df.empty else {}
+    unidad = None
+    if pid_sel:
+        fila = stock_actual()[stock_actual().id == pid_sel]
+        unidad = fila.unidad.iloc[0] if not fila.empty else None
+    with st.form("f_salida_planta", clear_on_submit=True):
+        f = st.date_input("Fecha del pesaje", date.today())
+        lote = st.selectbox("Lote", [None] + list(opts_lote), format_func=lambda l: opts_lote.get(l, "(elige un lote)"))
+        c1, c2, c3 = st.columns(3)
+        cantidad = c1.number_input(f"Cantidad obtenida ({unidad or 'kg/L'})", min_value=0.0, step=0.5)
+        unidades = c2.number_input("Unidades", min_value=0, step=1)
+        jabas = c3.number_input("N° de jabas", min_value=0, step=1)
+        doc = st.text_input("Documento (opcional)")
+        obs = st.text_input("Observaciones (opcional)")
+        if st.form_submit_button("Registrar salida de planta"):
+            if pid_sel is None or lote is None:
+                st.error("Elige el producto y el lote.")
+            else:
+                guardar(registrar_salida_planta, f, lote, pid_sel, cantidad, int(unidades) or None,
+                        int(jabas) or None, doc.strip() or None, obs.strip() or None)
+    form_anular("salida", q("""SELECT sp.id, 'N°' || sp.id || ' · ' || sp.fecha || ' · lote ' || sp.lote ||
+                                      ' · ' || p.nombre || ' · ' || sp.cantidad AS etiqueta
+                               FROM salida_planta sp JOIN productos p ON p.id = sp.producto_id
+                               WHERE sp.anulado = 0 ORDER BY sp.id DESC LIMIT 100"""), anular_salida_planta)
+    st.dataframe(q("""SELECT sp.id AS n, sp.fecha, sp.lote, p.nombre AS producto, sp.cantidad, p.unidad,
+                      sp.unidades, sp.n_jabas, sp.documento, sp.observacion,
+                      CASE sp.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado, sp.motivo_anulacion
+                      FROM salida_planta sp JOIN productos p ON p.id = sp.producto_id
+                      ORDER BY sp.fecha DESC, sp.id DESC"""),
+                 width="stretch", hide_index=True)
+
+
 def pag_despachos():
     st.header("Pedidos y despachos")
     pid_sel = st.selectbox("Producto a despachar", [None] + list(
@@ -1340,11 +1461,13 @@ def pag_despachos():
                  stock_actual()[stock_actual().tipo == "Producto terminado"].nombre))),
         format_func=lambda i: "Elige un producto para ver sus lotes" if i is None else
         dict(zip(stock_actual().id, stock_actual().nombre)).get(i, ""), key="desp_pid_lote")
-    lotes_df = q("""SELECT pr.id, 'Lote ' || pr.lote || ' · producido ' || pr.fecha || ' · ' ||
-                           COALESCE(o.nombre, 's/operador') || ' · ' || pr.cantidad_obtenida || ' obtenidos'
-                           AS etiqueta, pr.lote
-                    FROM produccion pr LEFT JOIN operadores o ON o.id = pr.operador_id
-                    WHERE pr.anulado = 0 AND pr.producto_id = ? ORDER BY pr.fecha DESC, pr.id DESC
+    lotes_df = q("""SELECT sp.id, 'Lote ' || sp.lote || ' · salida de planta ' || sp.fecha || ' · ' ||
+                           COALESCE(o.nombre, 's/operador') || ' · ' || sp.cantidad || ' obtenidos'
+                           AS etiqueta, sp.lote
+                    FROM salida_planta sp LEFT JOIN produccion pr ON pr.lote = sp.lote
+                                                                  AND pr.producto_id = sp.producto_id
+                    LEFT JOIN operadores o ON o.id = pr.operador_id
+                    WHERE sp.anulado = 0 AND sp.producto_id = ? ORDER BY sp.fecha DESC, sp.id DESC
                     LIMIT 100""", (pid_sel,)) if pid_sel else q("SELECT 1 WHERE 0")
     opts_lote = dict(zip(lotes_df.id.tolist(), lotes_df.etiqueta.tolist())) if not lotes_df.empty else {}
     with st.form("f_desp", clear_on_submit=True):
@@ -1474,40 +1597,57 @@ def pag_programacion():
                       ORDER BY g.fecha DESC, g.id DESC"""),
                  width="stretch", hide_index=True)
 
-def pag_trazabilidad():
-    st.header("Trazabilidad de producto terminado")
-    st.caption("Cada producción abre su registro solo (lote, producto, responsable y fecha de producción). "
-               "Aquí completas las etapas a medida que ocurren.")
+def pag_empaquetado():
+    st.header("Empaquetado")
+    st.caption("Aquí registras lo que pasa con cada lote después de salir de planta: ingreso a empaque, "
+               "envasado, ingreso a la cámara de maduración y salida final. Cada lote aparece solo apenas "
+               "lo registras en «Producción y mermas».")
     vig = q("""SELECT t.id, 'N°' || t.id || ' · lote ' || COALESCE(t.lote, '-') || ' · ' || p.nombre ||
                       ' · producido ' || t.fecha_produccion AS etiqueta
                FROM trazabilidad t JOIN productos p ON p.id = t.producto_id
                WHERE t.anulado = 0 ORDER BY t.id DESC LIMIT 200""")
     if vig.empty:
-        st.info("Aún no hay lotes: se crean automáticamente al registrar una producción.")
-    else:
-        with st.expander("Registrar etapa de un lote (empaque, envasado, maduración, salida)", expanded=True):
-            opts = dict(zip(vig.id.tolist(), vig.etiqueta.tolist()))
-            sel = st.selectbox("Lote", list(opts), format_func=opts.get)
-            with st.form("f_traz", clear_on_submit=True):
-                t1, t2 = st.columns(2)
-                d_emp = t1.date_input("Ingreso al área de empaque", value=None)
-                d_env = t2.date_input("Envasado", value=None)
-                t3, t4 = st.columns(2)
-                d_mad = t3.date_input("Ingreso a la cámara de maduración", value=None)
-                d_sal = t4.date_input("Salida del producto", value=None)
-                c_dest1, c_dest2 = st.columns(2)
-                with c_dest1:
-                    destino = pick_destino("Destino inicial", key="traz_dest")
-                with c_dest2:
-                    destino_final = pick_destino("Destino final (tienda)", key="traz_dest_final")
-                obs = st.text_input("Observaciones (opcional)")
-                if st.form_submit_button("Guardar etapas"):
-                    guardar(actualizar_trazabilidad, sel, d_emp, d_env, d_mad, d_sal, destino,
-                            destino_final, obs.strip() or None, ok="Etapas guardadas.")
+        st.info("Todavía no hay ningún lote. En cuanto registres una producción en «Producción y mermas», "
+                "aparecerá aquí para que le agregues sus etapas de empaque.")
+        return
+    opts = dict(zip(vig.id.tolist(), vig.etiqueta.tolist()))
+    sel = st.selectbox("Lote", list(opts), format_func=opts.get)
+    with st.form("f_traz", clear_on_submit=True):
+        st.markdown("**En planta**")
+        d_mad = st.date_input("Ingreso a la cámara de maduración de planta (la grande)", value=None)
+        st.markdown("**En empaquetado**")
+        t1, t2 = st.columns(2)
+        d_emp = t1.date_input("Ingreso al área de empaque", value=None)
+        d_env = t2.date_input("Envasado", value=None)
+        d_mad_emp = st.date_input("Ingreso a la cámara de maduración de empaquetado (la chica)", value=None)
+        d_sal = st.date_input("Salida del producto", value=None)
+        c_dest1, c_dest2 = st.columns(2)
+        with c_dest1:
+            destino = pick_destino("Destino inicial", key="traz_dest")
+        with c_dest2:
+            destino_final = pick_destino("Destino final (tienda)", key="traz_dest_final")
+        obs = st.text_input("Observaciones (opcional)")
+        if st.form_submit_button("Guardar etapas"):
+            guardar(actualizar_trazabilidad, sel, d_mad, d_emp, d_env, d_mad_emp, d_sal, destino,
+                    destino_final, obs.strip() or None, ok="Etapas guardadas.")
+    st.subheader("Lotes recientes")
+    st.dataframe(q("""SELECT t.id AS n, t.lote, p.nombre AS producto, t.fecha_produccion,
+                      t.fecha_maduracion AS maduracion_planta, t.fecha_empaque, t.fecha_envasado,
+                      t.fecha_maduracion_empaque AS maduracion_empaque, t.fecha_salida
+                      FROM trazabilidad t JOIN productos p ON p.id = t.producto_id
+                      WHERE t.anulado = 0 ORDER BY t.id DESC LIMIT 30"""),
+                 width="stretch", hide_index=True)
+
+
+def pag_trazabilidad():
+    st.header("Trazabilidad de producto terminado")
+    st.caption("Vista de consulta: todas las etapas de cada lote, de principio a fin. Para agregar o "
+               "corregir una etapa, ve al módulo «Empaquetado».")
     solo_pend = st.checkbox("Solo lotes que aún no salieron")
     filtro = "WHERE t.anulado = 0 AND t.fecha_salida IS NULL" if solo_pend else ""
     st.dataframe(q(f"""SELECT t.id AS n, t.lote, p.codigo, p.nombre AS producto, o.nombre AS responsable,
-                       t.fecha_produccion, t.fecha_empaque, t.fecha_envasado, t.fecha_maduracion,
+                       t.fecha_produccion, t.fecha_maduracion AS maduracion_planta, t.fecha_empaque,
+                       t.fecha_envasado, t.fecha_maduracion_empaque AS maduracion_empaque,
                        t.fecha_salida, d.nombre AS destino_inicial, df.nombre AS destino_final_tienda, t.observacion,
                        CASE t.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado
                        FROM trazabilidad t JOIN productos p ON p.id = t.producto_id
@@ -1527,7 +1667,7 @@ def pag_almacen_pt():
     base = stock_actual()
     base = base[base.tipo == "Producto terminado"][["id", "nombre", "unidad", "stock", "stock_minimo"]].copy()
     flujos = {
-        "producido": ("SELECT producto_id, SUM(cantidad_obtenida) AS total FROM produccion "
+        "producido": ("SELECT producto_id, SUM(cantidad) AS total FROM salida_planta "
                       "WHERE anulado=0 AND fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
         "despachado": ("SELECT producto_id, SUM(cant_despachada) AS total FROM pedidos "
                        "WHERE anulado=0 AND fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
@@ -1648,7 +1788,7 @@ def resumen_periodo(desde, hasta):
               "WHERE anulado=0 AND fecha BETWEEN ? AND ?", (d, h)).v[0]
     return {
         "leche_recibida": float(leche), "leche_aceptada": float(aceptada), "leche_usada": float(usada),
-        "producido": _suma_por_unidad("produccion", "cantidad_obtenida", d, h),
+        "producido": _suma_por_unidad("salida_planta", "cantidad", d, h),
         "despachado": _suma_por_unidad("pedidos", "cant_despachada", d, h),
         "devuelto": _suma_por_unidad("devoluciones", "cantidad", d, h),
         "fill_rate": ind["fill_rate"], "recuperacion": ind["recuperacion_global"],
@@ -1699,7 +1839,7 @@ def tabla_por_producto(d, h):
                      JOIN productos p ON p.id = t.producto_id
                      WHERE t.anulado = 0 AND t.fecha BETWEEN ? AND ? GROUP BY p.nombre""",
                  (d, h)).set_index("nombre")["total"]
-    df = pd.concat({"producido": serie("produccion", "cantidad_obtenida"),
+    df = pd.concat({"producido": serie("salida_planta", "cantidad"),
                     "despachado": serie("pedidos", "cant_despachada"),
                     "devuelto": serie("devoluciones", "cantidad")}, axis=1).fillna(0.0)
     df.index.name = "producto"
@@ -1880,10 +2020,13 @@ def cargar_datos_ejemplo():
         suero = round((litros_recibidos - 50) * 0.84, 0)
         vendido, usado = round(suero * 0.8), round(suero * 0.15)
         operador_prod = operadores[(dia_n + 1) % len(operadores)]
-        registrar_produccion(f, lote, _pid_demo(producto_dia), litros_recibidos - 50, obtenida,
+        registrar_produccion(f, lote, _pid_demo(producto_dia), litros_recibidos - 50,
                              suero, vendido, usado, operador_prod,
                              insumos=insumos_ejemplo if dia_n % 3 == 0 else None)
         lotes_creados.append(lote)
+        # La salida de planta (pesaje real) — en la demo la registramos el mismo día, por simplicidad
+        registrar_salida_planta(f, lote, _pid_demo(producto_dia), obtenida,
+                                unidades=int(obtenida * 4), n_jabas=max(1, int(obtenida // 10)))
 
         if dia_n % 2 == 0:
             destino = destinos[dia_n % len(destinos)]
@@ -1960,6 +2103,8 @@ PAGINAS = {
     "Llegada y análisis de leche": pag_recepcion,
     "Pasteurización": pag_pasteurizacion,
     "Producción y mermas": pag_produccion,
+    "Salida de planta": pag_salida_planta,
+    "Empaquetado": pag_empaquetado,
     "Trazabilidad": pag_trazabilidad,
     "Pedidos y despachos": pag_despachos,
     "Pedidos devueltos": pag_devoluciones,
