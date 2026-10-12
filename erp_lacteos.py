@@ -151,6 +151,18 @@ CREATE TABLE IF NOT EXISTS programacion (
     anulado INTEGER NOT NULL DEFAULT 0,
     motivo_anulacion TEXT
 );
+CREATE TABLE IF NOT EXISTS pedidos_cliente (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fecha TEXT NOT NULL,
+    destino_id INTEGER REFERENCES destinos(id),
+    cliente TEXT,
+    producto_id INTEGER NOT NULL REFERENCES productos(id),
+    cantidad_solicitada REAL NOT NULL,
+    responsable_id INTEGER REFERENCES operadores(id),
+    observacion TEXT,
+    anulado INTEGER NOT NULL DEFAULT 0,
+    motivo_anulacion TEXT
+);
 CREATE TABLE IF NOT EXISTS salida_planta (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fecha TEXT NOT NULL,
@@ -293,6 +305,7 @@ def migrar(con):
         ("pasteurizacion", "producto_id", "INTEGER REFERENCES productos(id)"),
         ("pedidos", "destino_id", "INTEGER REFERENCES destinos(id)"),
         ("pedidos", "lote", "TEXT"),
+        ("pedidos", "pedido_cliente_id", "INTEGER REFERENCES pedidos_cliente(id)"),
         ("trazabilidad", "fecha_maduracion_empaque", "TEXT"),
         ("pedidos", "responsable_envio_id", "INTEGER REFERENCES operadores(id)"),
         ("devoluciones", "destino_id", "INTEGER REFERENCES destinos(id)"),
@@ -745,18 +758,51 @@ def _nombre_destino(con, destino_id):
         raise ValueError("El destino elegido no existe.")
     return fila[0]
 
+def registrar_pedido_cliente(fecha, destino_id, cliente, pid, cantidad, responsable_id=None,
+                             observacion=None):
+    if cantidad <= 0:
+        raise ValueError("La cantidad solicitada debe ser mayor que cero.")
+    if destino_id is None and not (cliente or "").strip():
+        raise ValueError("Elige la tienda o escribe el cliente.")
+    transaccion(lambda con: con.execute(
+        "INSERT INTO pedidos_cliente (fecha, destino_id, cliente, producto_id, cantidad_solicitada, "
+        "responsable_id, observacion) VALUES (?,?,?,?,?,?,?)",
+        (str(fecha), destino_id, (cliente or "").strip() or None, pid, cantidad, responsable_id,
+         observacion)))
+
+def anular_pedido_cliente(rid, motivo):
+    def _op(con):
+        if con.execute("SELECT 1 FROM pedidos WHERE pedido_cliente_id=? AND anulado=0",
+                       (rid,)).fetchone():
+            raise ValueError("Ese pedido ya tiene despachos asociados: anúlalos primero.")
+        _marcar_anulado(con, "pedidos_cliente", rid, motivo)
+    transaccion(_op)
+
 def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento, destino_id=None,
-                       responsable_id=None, lote=None):
+                       responsable_id=None, lote=None, pedido_cliente_id=None):
     if despachada > pedida:
         raise ValueError("No se puede despachar más de lo pedido.")
     if destino_id is None and not (cliente or "").strip():
         raise ValueError("Elige la tienda de destino o escribe el cliente.")
     def _op(con):
         cli = _nombre_destino(con, destino_id) if destino_id is not None else cliente
+        if pedido_cliente_id is not None:
+            pc = con.execute("SELECT producto_id, cantidad_solicitada, anulado FROM pedidos_cliente "
+                             "WHERE id=?", (pedido_cliente_id,)).fetchone()
+            if pc is None or pc[2]:
+                raise ValueError("Ese pedido de cliente no existe o está anulado.")
+            if pc[0] != pid:
+                raise ValueError("El producto del despacho no coincide con el del pedido elegido.")
+            ya = con.execute("SELECT COALESCE(SUM(cant_despachada), 0) FROM pedidos "
+                             "WHERE pedido_cliente_id=? AND anulado=0", (pedido_cliente_id,)).fetchone()[0]
+            if ya + despachada > pc[1] + 1e-9:
+                raise ValueError(f"Ese pedido fue de {pc[1]:g} y ya se atendieron {ya:g}; "
+                                 f"no se pueden despachar {despachada:g} más.")
         con.execute(
             "INSERT INTO pedidos (fecha, cliente, producto_id, cant_pedida, cant_despachada, documento, "
-            "destino_id, responsable_envio_id, lote) VALUES (?,?,?,?,?,?,?,?,?)",
-            (str(fecha), cli, pid, pedida, despachada, documento, destino_id, responsable_id, lote))
+            "destino_id, responsable_envio_id, lote, pedido_cliente_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (str(fecha), cli, pid, pedida, despachada, documento, destino_id, responsable_id, lote,
+             pedido_cliente_id))
         if despachada > 0:
             mover(con, fecha, pid, "SALIDA", "Despacho a cliente", despachada, documento, cli)
     transaccion(_op)
@@ -847,9 +893,20 @@ def indicadores(desde, hasta):
     out["exactitud"] = (c.stock_fisico.sum() / teorico * 100) if len(c) and teorico else None
     out["conteos_periodo"] = len(c)
 
-    p = q("SELECT SUM(cant_pedida) ped, SUM(cant_despachada) des FROM pedidos "
-          "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
-    out["fill_rate"] = (p.des[0] / p.ped[0] * 100) if p.ped[0] else None
+    # Fill rate = lo atendido (despachos ligados a un pedido de cliente) ÷ lo solicitado por esos pedidos.
+    # Así, un pedido que nunca se despachó (demanda no atendida) también cuenta en el denominador.
+    pc = q("""SELECT pc.id, pc.cantidad_solicitada,
+                     COALESCE((SELECT SUM(pe.cant_despachada) FROM pedidos pe
+                               WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS atendido
+              FROM pedidos_cliente pc
+              WHERE pc.fecha BETWEEN ? AND ? AND pc.anulado = 0""", (d, h))
+    solicitado_total = pc.cantidad_solicitada.sum() if len(pc) else 0
+    out["fill_rate"] = (pc.atendido.sum() / solicitado_total * 100) if solicitado_total else None
+    out["pedidos_cliente_periodo"] = len(pc)
+
+    desp_tot = q("SELECT COALESCE(SUM(cant_despachada), 0) AS des FROM pedidos "
+                 "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
+    despachado = desp_tot.des[0]
 
     pr = q("""SELECT p.nombre, SUM(pr.litros_leche) leche, SUM(COALESCE(sp.cantidad, 0)) obtenido,
                      SUM(pr.suero_obtenido) suero, SUM(pr.suero_vendido) vendido, SUM(pr.suero_usado) usado
@@ -872,7 +929,6 @@ def indicadores(desde, hasta):
 
     dv = q("SELECT COALESCE(SUM(cantidad), 0) AS dev FROM devoluciones "
            "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
-    despachado = p.des[0]
     out["devuelto"] = float(dv.dev[0])
     out["tasa_devoluciones"] = (dv.dev[0] / despachado * 100
                                 if despachado is not None and pd.notna(despachado) and despachado > 0
@@ -1454,6 +1510,45 @@ def pag_salida_planta():
                  width="stretch", hide_index=True)
 
 
+def pag_pedidos_cliente():
+    st.header("Pedidos de clientes")
+    st.caption("Registra aquí lo que piden las tiendas o los clientes, SE HAYA PODIDO ATENDER O NO. "
+               "Esto es clave para el fill rate: un pedido que nunca se despachó también debe quedar "
+               "anotado, porque es demanda real que no se pudo cubrir.")
+    with st.form("f_pedcli", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        f = c1.date_input("Fecha del pedido", date.today())
+        pid = pick_producto("Producto", ["Producto terminado"], key="pedcli_pid")
+        destino = pick_destino("Tienda que pide")
+        cliente = st.text_input("Cliente (si no es una tienda)")
+        cant = st.number_input("Cantidad solicitada", min_value=0.0, step=1.0)
+        resp = pick_operador("Quién tomó el pedido (opcional)", obligatorio=False)
+        obs = st.text_input("Observaciones (opcional)")
+        if st.form_submit_button("Registrar pedido"):
+            guardar(registrar_pedido_cliente, f, destino, cliente.strip(), pid, cant, resp,
+                    obs.strip() or None)
+    vig = q("""SELECT pc.id, 'N°' || pc.id || ' · ' || pc.fecha || ' · ' ||
+                      COALESCE(d.nombre, pc.cliente, 's/cliente') || ' · ' || p.nombre AS etiqueta
+               FROM pedidos_cliente pc JOIN productos p ON p.id = pc.producto_id
+               LEFT JOIN destinos d ON d.id = pc.destino_id
+               WHERE pc.anulado = 0 ORDER BY pc.id DESC LIMIT 100""")
+    form_anular("pedcli", vig, anular_pedido_cliente)
+    st.subheader("Solicitado vs atendido")
+    st.dataframe(q("""SELECT pc.id AS n, pc.fecha, COALESCE(d.nombre, pc.cliente, 's/cliente') AS tienda_cliente,
+                      p.nombre AS producto, pc.cantidad_solicitada,
+                      COALESCE((SELECT SUM(pe.cant_despachada) FROM pedidos pe
+                                WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS atendido,
+                      pc.cantidad_solicitada - COALESCE((SELECT SUM(pe.cant_despachada) FROM pedidos pe
+                                WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS pendiente,
+                      o.nombre AS tomado_por, pc.observacion,
+                      CASE pc.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado, pc.motivo_anulacion
+                      FROM pedidos_cliente pc JOIN productos p ON p.id = pc.producto_id
+                      LEFT JOIN destinos d ON d.id = pc.destino_id
+                      LEFT JOIN operadores o ON o.id = pc.responsable_id
+                      ORDER BY pc.fecha DESC, pc.id DESC"""),
+                 width="stretch", hide_index=True)
+
+
 def pag_despachos():
     st.header("Pedidos y despachos")
     pid_sel = st.selectbox("Producto a despachar", [None] + list(
@@ -1470,12 +1565,27 @@ def pag_despachos():
                     WHERE sp.anulado = 0 AND sp.producto_id = ? ORDER BY sp.fecha DESC, sp.id DESC
                     LIMIT 100""", (pid_sel,)) if pid_sel else q("SELECT 1 WHERE 0")
     opts_lote = dict(zip(lotes_df.id.tolist(), lotes_df.etiqueta.tolist())) if not lotes_df.empty else {}
+    pedidos_pend_df = q("""SELECT pc.id, 'N°' || pc.id || ' · ' || pc.fecha || ' · ' ||
+                                  COALESCE(d.nombre, pc.cliente, 's/cliente') || ' · pidió ' ||
+                                  pc.cantidad_solicitada || ', faltan ' ||
+                                  (pc.cantidad_solicitada - COALESCE((SELECT SUM(pe.cant_despachada)
+                                   FROM pedidos pe WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0))
+                                  AS etiqueta
+                           FROM pedidos_cliente pc LEFT JOIN destinos d ON d.id = pc.destino_id
+                           WHERE pc.anulado = 0 AND pc.producto_id = ?
+                             AND pc.cantidad_solicitada > COALESCE((SELECT SUM(pe.cant_despachada)
+                                 FROM pedidos pe WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0)
+                           ORDER BY pc.fecha LIMIT 100""", (pid_sel,)) if pid_sel else q("SELECT 1 WHERE 0")
+    opts_pedcli = dict(zip(pedidos_pend_df.id.tolist(), pedidos_pend_df.etiqueta.tolist())) if not pedidos_pend_df.empty else {}
     with st.form("f_desp", clear_on_submit=True):
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha", date.today())
         destino = pick_destino("Tienda de destino")
         cliente = c2.text_input("Cliente (si no es una tienda)")
         pid = pick_producto("Producto", ["Producto terminado"], key="desp_pid_form")
+        pedcli_id = st.selectbox(
+            "Pedido de cliente que se atiende (opcional, elige arriba el producto para ver pedidos pendientes)",
+            [None] + list(opts_pedcli), format_func=lambda i: opts_pedcli.get(i, "(despacho sin pedido previo)"))
         lote_id = st.selectbox(
             "Lote despachado (opcional, elige arriba el producto para ver sus lotes)",
             [None] + list(opts_lote), format_func=lambda i: opts_lote.get(i, "(sin lote específico)"))
@@ -1487,19 +1597,19 @@ def pag_despachos():
         if st.form_submit_button("Registrar despacho"):
             if pedida <= 0:
                 st.error("La cantidad pedida es obligatoria.")
-            elif pid != pid_sel and lote_id is not None:
-                st.error("El producto elegido abajo no es el mismo del lote seleccionado arriba. "
-                         "Vuelve a elegir el producto arriba para actualizar la lista de lotes.")
+            elif pid != pid_sel and (lote_id is not None or pedcli_id is not None):
+                st.error("El producto elegido abajo no es el mismo que elegiste arriba. "
+                         "Vuelve a elegir el producto arriba para actualizar las listas.")
             else:
                 lote_txt = opts_lote.get(lote_id) and lotes_df.set_index("id").loc[lote_id, "lote"]
                 guardar(registrar_despacho, f, cliente.strip(), pid, pedida, desp, doc.strip() or None,
-                        destino, resp, lote_txt)
+                        destino, resp, lote_txt, pedcli_id)
     form_anular("desp", q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' ||
                                     p.nombre || ' · ' || d.cant_despachada AS etiqueta
                              FROM pedidos d JOIN productos p ON p.id = d.producto_id
                              WHERE d.anulado = 0 ORDER BY d.id DESC LIMIT 100"""), anular_despacho)
     st.dataframe(q("""SELECT d.id AS n, d.fecha, d.cliente, p.nombre AS producto, d.lote,
-                      op_prod.nombre AS quien_produjo_el_lote,
+                      op_prod.nombre AS quien_produjo_el_lote, d.pedido_cliente_id AS pedido_cliente,
                       d.cant_pedida, d.cant_despachada,
                       ROUND(d.cant_despachada * 100.0 / d.cant_pedida, 1) AS "fill_rate_%",
                       d.documento, o.nombre AS responsable_envio,
@@ -1754,7 +1864,9 @@ def pag_indicadores():
               help="Suma del inventario físico contado ÷ suma del stock teórico del sistema en el "
                    f"momento del conteo (basado en {r['conteos_periodo']} conteos del periodo).")
     m3.metric(f"Fill rate (criterio ≥{META_FILL_RATE}%)", fmt(r["fill_rate"]),
-              help="Cantidad despachada ÷ cantidad pedida por los clientes.")
+              help="Cantidad atendida ÷ cantidad solicitada en «Pedidos de clientes» "
+                   f"({r['pedidos_cliente_periodo']} pedidos en el periodo). Un pedido sin ningún "
+                   "despacho cuenta como no atendido.")
     m4.metric("Suero desechado", fmt(r["suero_merma_%"]),
               help="Suero obtenido que no se vendió ni se usó en la planta ÷ suero obtenido.")
     st.subheader("Otros datos de la planta")
@@ -2106,6 +2218,7 @@ PAGINAS = {
     "Salida de planta": pag_salida_planta,
     "Empaquetado": pag_empaquetado,
     "Trazabilidad": pag_trazabilidad,
+    "Pedidos de clientes": pag_pedidos_cliente,
     "Pedidos y despachos": pag_despachos,
     "Pedidos devueltos": pag_devoluciones,
     "Almacén de producto terminado": pag_almacen_pt,
