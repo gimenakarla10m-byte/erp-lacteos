@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS programacion (
     lote TEXT,
     producto_id INTEGER NOT NULL REFERENCES productos(id),
     litros_programados REAL NOT NULL,
+    litros_usados REAL DEFAULT NULL,
     responsable_id INTEGER REFERENCES operadores(id),
     observacion TEXT,
     anulado INTEGER NOT NULL DEFAULT 0,
@@ -254,14 +255,12 @@ SEED_PRODUCTOS = [
     ("SB-SUERO", "Suero de leche", "Subproducto", "L", 0),
 ]
 
-# ─────────────────────────── Capa de datos ───────────────────────────
 def get_conn():
     con = sqlite3.connect(DB)
     con.execute("PRAGMA foreign_keys = ON")
     return con
 
 def q(sql, params=()):
-    """SELECT -> DataFrame."""
     con = get_conn()
     try:
         return pd.read_sql_query(sql, con, params=params)
@@ -315,6 +314,7 @@ def migrar(con):
         ("devoluciones", "lote_devuelto", "TEXT"),
         ("trazabilidad", "destino_final_id", "INTEGER REFERENCES destinos(id)"),
         ("programacion", "lote", "TEXT"),
+        ("programacion", "litros_usados", "REAL DEFAULT NULL"),
     ]
     for tabla, col, definicion in nuevas:
         if col not in [r[1] for r in con.execute(f"PRAGMA table_info({tabla})")]:
@@ -597,6 +597,12 @@ def registrar_programacion(fecha, lote, pid, litros, responsable_id=None, observ
         "INSERT INTO programacion (fecha, lote, producto_id, litros_programados, responsable_id, observacion) "
         "VALUES (?,?,?,?,?,?)", (str(fecha), lote, pid, litros, responsable_id, observacion)))
 
+def actualizar_litros_usados_programacion(prog_id, litros_usados):
+    if litros_usados < 0:
+        raise ValueError("Los litros usados no pueden ser negativos.")
+    transaccion(lambda con: con.execute(
+        "UPDATE programacion SET litros_usados = ? WHERE id = ?", (litros_usados, prog_id)))
+
 def anular_programacion(rid, motivo):
     transaccion(lambda con: _eliminar_definitivo(con, "programacion", rid, motivo))
 
@@ -861,7 +867,6 @@ def registrar_conteo(fecha, pid, fisico, ajustar):
                   "Ajuste por inventario físico", abs(dif), f"CONTEO-{fecha}")
     transaccion(_op)
 
-# ── Consultas ──
 def stock_actual():
     return q("""
         SELECT p.id, p.codigo, p.nombre, p.tipo, p.unidad, p.stock_minimo,
@@ -940,7 +945,6 @@ def indicadores(desde, hasta):
                                 else None)
     return out
 
-# ─────────────────────────── Interfaz ───────────────────────────
 def pick_producto(label, tipos=None, key=None):
     df = stock_actual()
     if tipos:
@@ -1418,14 +1422,24 @@ def pag_produccion():
             prod_nombre = f_prod.iloc[0]["nombre"]
 
     # Insumos dinámicos según el producto
-    if "manjar" in prod_nombre.lower():
+    p_lower = prod_nombre.lower()
+    if "manjar" in p_lower:
         insumos_config = [
             {"insumo": "Azúcar", "label": "Azúcar (kg)", "step": 0.5},
             {"insumo": "Bicarbonato", "label": "Bicarbonato (g)", "step": 1.0},
             {"insumo": "Glucosa", "label": "Glucosa (g)", "step": 1.0},
             {"insumo": "Caragel", "label": "Caragel (g)", "step": 1.0},
         ]
-    elif "yogurt" in prod_nombre.lower():
+    elif "natilla" in p_lower:
+        insumos_config = [
+            {"insumo": "Azúcar", "label": "Azúcar (kg)", "step": 0.5},
+            {"insumo": "Glucosa", "label": "Glucosa (kg)", "step": 0.5},
+            {"insumo": "Margarina", "label": "Margarina (g)", "step": 1.0},
+            {"insumo": "Caramelina", "label": "Caramelina (g)", "step": 1.0},
+            {"insumo": "Bicarbonato", "label": "Bicarbonato (g)", "step": 1.0},
+            {"insumo": "Caragel", "label": "Caragel (g)", "step": 1.0},
+        ]
+    elif "yogurt" in p_lower:
         insumos_config = [
             {"insumo": "Conservantes", "label": "Conservantes (g)", "step": 1.0},
             {"insumo": "Colorantes", "label": "Colorantes (g)", "step": 1.0},
@@ -1562,7 +1576,6 @@ def pag_salida_planta():
                       ORDER BY sp.fecha DESC, sp.id DESC"""),
                  width="stretch", hide_index=True)
 
-
 def pag_pedidos_cliente():
     st.header("Pedidos de clientes")
     st.caption("Registra aquí lo que piden las tiendas o los clientes, SE HAYA PODIDO ATENDER O NO. "
@@ -1599,7 +1612,6 @@ def pag_pedidos_cliente():
                       LEFT JOIN operadores o ON o.id = pc.responsable_id
                       ORDER BY pc.fecha DESC, pc.id DESC"""),
                  width="stretch", hide_index=True)
-
 
 def pag_despachos():
     st.header("Pedidos y despachos")
@@ -1749,23 +1761,45 @@ def pag_programacion():
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar programación"):
             guardar(registrar_programacion, f, lote.strip() or None, pid, litros, oper, obs.strip() or None)
-            
+
+    prog_vigente = q("""SELECT g.id, 'N°' || g.id || ' · ' || g.fecha || ' · Lote: ' || COALESCE(g.lote, 's/lote') ||
+                               ' · ' || p.nombre || ' (Prog: ' || g.litros_programados || ' L)' AS etiqueta
+                        FROM programacion g JOIN productos p ON p.id = g.producto_id
+                        WHERE g.anulado = 0 ORDER BY g.id DESC LIMIT 100""")
+    if not prog_vigente.empty:
+        with st.expander("✏️ Actualizar / Registrar ejecución real del lote (litros usados manuales)"):
+            st.caption("Si deseas ingresar los litros de leche usados manualmente sin esperar al registro de producción, elígelo aquí:")
+            opts_p = dict(zip(prog_vigente.id.tolist(), prog_vigente.etiqueta.tolist()))
+            with st.form("f_edit_litros_usados", clear_on_submit=True):
+                sel_p = st.selectbox("Selecciona la programación a actualizar", list(opts_p), format_func=opts_p.get)
+                l_usados = st.number_input("Litros de leche realmente usados", min_value=0.0, step=10.0)
+                if st.form_submit_button("Guardar litros usados"):
+                    guardar(actualizar_litros_usados_programacion, sel_p, l_usados, ok="Litros usados actualizados correctamente.")
+
     form_anular("prog", q("""SELECT g.id, 'N°' || g.id || ' · ' || g.fecha || ' · ' || p.nombre || ' · ' ||
                                     g.litros_programados || ' L' AS etiqueta
                              FROM programacion g JOIN productos p ON p.id = g.producto_id
                              WHERE g.anulado = 0 ORDER BY g.id DESC LIMIT 100"""), anular_programacion)
                              
     st.subheader("Programado vs producido")
-    st.caption("«Litros usados» son los litros de leche de las producciones registradas ese día para ese producto.")
+    st.caption("«Litros usados» muestra los litros registrados en «Producción y mermas» para este lote/producto o el valor ingresado manualmente.")
+    
     st.dataframe(q("""SELECT g.id AS n, g.fecha, g.lote, p.codigo AS codigo_producto, p.nombre AS producto, 
-                      o.nombre AS operador_responsable, g.litros_programados, COALESCE(u.usados, 0) AS litros_usados,
-                      ROUND(COALESCE(u.usados, 0) * 100.0 / g.litros_programados, 1) AS "cumplimiento_%",
+                      o.nombre AS operador_responsable, g.litros_programados, 
+                      COALESCE(g.litros_usados, pr_lote.usados, pr_fecha.usados, 0) AS litros_usados,
+                      ROUND(COALESCE(g.litros_usados, pr_lote.usados, pr_fecha.usados, 0) * 100.0 / g.litros_programados, 1) AS "cumplimiento_%",
                       g.observacion
-                      FROM programacion g JOIN productos p ON p.id = g.producto_id
+                      FROM programacion g 
+                      JOIN productos p ON p.id = g.producto_id
                       LEFT JOIN operadores o ON o.id = g.responsable_id
-                      LEFT JOIN (SELECT fecha, producto_id, SUM(litros_leche) AS usados FROM produccion
-                                 WHERE anulado = 0 GROUP BY fecha, producto_id) u
-                             ON u.fecha = g.fecha AND u.producto_id = g.producto_id
+                      LEFT JOIN (SELECT lote, producto_id, SUM(litros_leche) AS usados 
+                                 FROM produccion WHERE anulado = 0 AND lote IS NOT NULL AND TRIM(lote) <> ''
+                                 GROUP BY lote, producto_id) pr_lote
+                             ON pr_lote.lote = g.lote AND pr_lote.producto_id = g.producto_id
+                      LEFT JOIN (SELECT fecha, producto_id, SUM(litros_leche) AS usados 
+                                 FROM produccion WHERE anulado = 0 
+                                 GROUP BY fecha, producto_id) pr_fecha
+                             ON pr_fecha.fecha = g.fecha AND pr_fecha.producto_id = g.producto_id
                       WHERE g.anulado = 0
                       ORDER BY g.fecha DESC, g.id DESC"""),
                  width="stretch", hide_index=True)
@@ -1810,7 +1844,6 @@ def pag_empaquetado():
                       FROM trazabilidad t JOIN productos p ON p.id = t.producto_id
                       WHERE t.anulado = 0 ORDER BY t.id DESC LIMIT 30"""),
                  width="stretch", hide_index=True)
-
 
 def pag_trazabilidad():
     st.header("Trazabilidad de producto terminado")
@@ -1941,7 +1974,6 @@ def pag_indicadores():
         with st.expander("Recuperación de leche por producto"):
             st.dataframe(r["detalle_produccion"], width="stretch", hide_index=True)
 
-# ─────────────────────────── Resumen por semana / mes / año ───────────────────────────
 def _suma_por_unidad(tabla, campo, d, h):
     cond = "t.anulado = 0 AND " if tabla == "recepcion_leche" else ""
     df = q(f"""SELECT p.unidad, SUM(t.{campo}) AS total FROM {tabla} t
