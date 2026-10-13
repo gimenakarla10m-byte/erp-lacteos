@@ -839,7 +839,7 @@ def registrar_devolucion(fecha, cliente, pid, cantidad, motivo, destino, despach
             cli, prod, despachada = fila[0], fila[1], fila[2]
             dest_id = con.execute("SELECT destino_id FROM pedidos WHERE id=?", (despacho_id,)).fetchone()[0]
             ya = con.execute("SELECT COALESCE(SUM(cantidad), 0) FROM devoluciones "
-                             "WHERE despacho_id=?", (despacho_id,)).fetchone()[0]
+                             "WHERE despacho_id=? ANDulado=0", (despacho_id,)).fetchone()[0]
             if cantidad + ya > despachada + 1e-9:
                 raise ValueError(f"Ese despacho fue de {despachada:g} y ya se devolvieron {ya:g}; "
                                  f"no se pueden devolver {cantidad:g} más.")
@@ -938,7 +938,7 @@ def indicadores(desde, hasta):
     out["pasteurizaciones"] = len(pa)
 
     dv = q("SELECT COALESCE(SUM(cantidad), 0) AS dev FROM devoluciones "
-           "WHERE fecha BETWEEN ? AND ?", (d, h))
+           "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
     out["devuelto"] = float(dv.dev[0])
     out["tasa_devoluciones"] = (dv.dev[0] / despachado * 100
                                 if despachado is not None and pd.notna(despachado) and despachado > 0
@@ -1638,15 +1638,15 @@ def pag_despachos():
 def pag_devoluciones():
     st.header("Pedidos devueltos")
     desp = q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' || p.nombre ||
-                       ' · lote: ' || COALESCE(d.lote, 's/lote') || ' · despachado ' || d.cant_despachada AS etiqueta
+                       ' · despachado ' || d.cant_despachada AS etiqueta
                 FROM pedidos d JOIN productos p ON p.id = d.producto_id
                 ORDER BY d.id DESC LIMIT 100""")
     opts_d = dict(zip(desp.id.tolist(), desp.etiqueta.tolist()))
     with st.form("f_dev", clear_on_submit=True):
         origen = st.selectbox("Despacho de origen (opcional)", [None] + list(opts_d),
                               format_func=lambda i: opts_d.get(i, "(sin despacho de origen)"))
-        st.caption("Si eliges un despacho, el sistema identificará automáticamente el lote y el operador "
-                   "responsable que elaboró ese producto en la planta.")
+        st.caption("Si eliges un despacho que tenía un lote asociado, se identificará automáticamente el "
+                   "operador que produjo ese lote. Si el despacho no tenía lote, no se podrá identificar.")
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha de devolución", date.today())
         with c2:
@@ -1669,11 +1669,11 @@ def pag_devoluciones():
     form_anular("dev", q("""SELECT dv.id, 'N°' || dv.id || ' · ' || dv.fecha || ' · ' || dv.cliente || ' · ' ||
                                    p.nombre || ' · ' || dv.cantidad AS etiqueta
                             FROM devoluciones dv JOIN productos p ON p.id = dv.producto_id
-                            ORDER BY dv.id DESC LIMIT 100"""), anular_devolucion)
+                            WHERE dv.anulado = 0 ORDER BY dv.id DESC LIMIT 100"""), anular_devolucion)
     st.dataframe(q("""SELECT dv.id AS n, dv.fecha, dv.cliente, p.codigo AS codigo_prod, p.nombre AS producto,
-                      ped.lote AS lote_devuelto,
-                      op_prod.nombre AS operador_que_produjo,
+                      ped.lote AS lote_despachado,
                       dv.cantidad, dv.motivo, dv.destino AS destino_producto,
+                      op_prod.nombre AS operador_que_produjo,
                       op_rec.nombre AS responsable_recepcion,
                       dv.documento, dv.observacion
                       FROM devoluciones dv
@@ -1793,10 +1793,10 @@ def pag_almacen_pt():
         "despachado": ("SELECT producto_id, SUM(cant_despachada) AS total FROM pedidos "
                        "WHERE fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
         "devuelto_reingresado": ("SELECT producto_id, SUM(cantidad) AS total FROM devoluciones "
-                                 "WHERE destino=? AND fecha BETWEEN ? AND ? "
+                                 "WHERE anulado=0 AND destino=? AND fecha BETWEEN ? AND ? "
                                  "GROUP BY producto_id", (DESTINO_REINGRESO, d, h)),
         "devuelto_merma": ("SELECT producto_id, SUM(cantidad) AS total FROM devoluciones "
-                           "WHERE destino=? AND fecha BETWEEN ? AND ? "
+                           "WHERE anulado=0 AND destino=? AND fecha BETWEEN ? AND ? "
                            "GROUP BY producto_id", (DESTINO_MERMA, d, h)),
     }
     for col, (sql, params) in flujos.items():
@@ -1891,7 +1891,7 @@ def pag_indicadores():
 
 # ─────────────────────────── Resumen por semana / mes / año ───────────────────────────
 def _suma_por_unidad(tabla, campo, d, h):
-    cond = "t.anulado = 0 AND " if tabla == "recepcion_leche" else ""
+    cond = "t.anulado = 0 AND " if tabla != "pedidos" else ""
     df = q(f"""SELECT p.unidad, SUM(t.{campo}) AS total FROM {tabla} t
                JOIN productos p ON p.id = t.producto_id
                WHERE {cond}t.fecha BETWEEN ? AND ? GROUP BY p.unidad""", (d, h))
@@ -1961,7 +1961,7 @@ def tabla_por_producto(d, h):
                  (d, h)).set_index("nombre")["total"]
     df = pd.concat({"producido": serie("salida_planta", "cantidad"),
                     "despachado": serie("pedidos", "cant_despachada", anulado_filtro=False),
-                    "devuelto": serie("devoluciones", "cantidad", anulado_filtro=False)}, axis=1).fillna(0.0)
+                    "devuelto": serie("devoluciones", "cantidad")}, axis=1).fillna(0.0)
     df.index.name = "producto"
     return df.reset_index()
 
