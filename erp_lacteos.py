@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS operadores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nombre TEXT NOT NULL,
     cargo TEXT,
+    area TEXT NOT NULL DEFAULT 'Planta',
     activo INTEGER DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS meta (
@@ -306,6 +307,7 @@ def migrar(con):
         ("pedidos", "destino_id", "INTEGER REFERENCES destinos(id)"),
         ("pedidos", "lote", "TEXT"),
         ("pedidos", "pedido_cliente_id", "INTEGER REFERENCES pedidos_cliente(id)"),
+        ("operadores", "area", "TEXT NOT NULL DEFAULT 'Planta'"),
         ("trazabilidad", "fecha_maduracion_empaque", "TEXT"),
         ("pedidos", "responsable_envio_id", "INTEGER REFERENCES operadores(id)"),
         ("devoluciones", "destino_id", "INTEGER REFERENCES destinos(id)"),
@@ -501,6 +503,21 @@ def _marcar_anulado(con, tabla, rid, motivo):
         raise ValueError("Ese registro ya está anulado.")
     con.execute(f"UPDATE {tabla} SET anulado=1, motivo_anulacion=? WHERE id=?", (motivo.strip(), rid))
 
+def _eliminar_definitivo(con, tabla, rid, motivo, antes=None):
+    """Borra el registro por completo (en vez de solo marcarlo anulado). Si la tabla tuvo un
+    movimiento de Kardex, la función que llama debe generar antes el movimiento contrario, pasando
+    el motivo como observación, para que quede el rastro en el Kardex aunque el registro desaparezca
+    de su propia lista. `antes`, si se da, corre justo antes del DELETE (para limpiar referencias
+    de otras tablas, como un despacho o devolución que apuntaba a este registro)."""
+    if not motivo or not motivo.strip():
+        raise ValueError("El motivo es obligatorio.")
+    fila = con.execute(f"SELECT 1 FROM {tabla} WHERE id=?", (rid,)).fetchone()
+    if fila is None:
+        raise ValueError("El registro no existe.")
+    if antes:
+        antes(con)
+    con.execute(f"DELETE FROM {tabla} WHERE id=?", (rid,))
+
 def _transaccion_anulacion(fn):
     try:
         transaccion(fn)
@@ -512,13 +529,13 @@ def _transaccion_anulacion(fn):
 
 def anular_recepcion(rid, motivo):
     def _op(con):
-        _marcar_anulado(con, "recepcion_leche", rid, motivo)
         litros, aprobada = con.execute(
             "SELECT COALESCE(litros_aceptados, litros), aprobada FROM recepcion_leche WHERE id=?",
             (rid,)).fetchone()
         if aprobada and litros > 0:
             mover(con, date.today(), producto_id(con, "MP-LECHE"), "SALIDA",
                   "Anulación de recepción", litros, f"ANUL-REC-{rid}", motivo)
+        _eliminar_definitivo(con, "recepcion_leche", rid, motivo)
     _transaccion_anulacion(_op)
 
 def anular_produccion(rid, motivo):
@@ -528,9 +545,6 @@ def anular_produccion(rid, motivo):
                        "AND anulado = 0", (lote, pid0)).fetchone():
             raise ValueError("Ese lote ya tiene registrada su salida de planta: anula primero esa "
                              "salida de planta.")
-        _marcar_anulado(con, "produccion", rid, motivo)
-        con.execute("UPDATE trazabilidad SET anulado=1, motivo_anulacion=? WHERE produccion_id=?",
-                    (motivo, rid))
         pid, litros, obtenida, suero, vendido, usado, con_merma = con.execute(
             "SELECT producto_id, litros_leche, cantidad_obtenida, suero_obtenido, suero_vendido, "
             "suero_usado, merma_en_kardex FROM produccion WHERE id=?", (rid,)).fetchone()
@@ -549,23 +563,28 @@ def anular_produccion(rid, motivo):
             mover(con, hoy, suero_id, "SALIDA", mot, suero, doc, motivo)
         if obtenida > 1e-9:  # dato antiguo (versiones previas sí movían stock aquí)
             mover(con, hoy, pid, "SALIDA", mot, obtenida, doc, motivo)
+        def _antes(con):
+            con.execute("DELETE FROM produccion_insumos WHERE produccion_id=?", (rid,))
+            con.execute("DELETE FROM trazabilidad WHERE produccion_id=?", (rid,))
+        _eliminar_definitivo(con, "produccion", rid, motivo, antes=_antes)
     _transaccion_anulacion(_op)
 
 def anular_devolucion(rid, motivo):
     def _op(con):
-        _marcar_anulado(con, "devoluciones", rid, motivo)
         pid, cantidad, destino = con.execute(
             "SELECT producto_id, cantidad, destino FROM devoluciones WHERE id=?", (rid,)).fetchone()
         if destino == DESTINO_REINGRESO:
             mover(con, date.today(), pid, "SALIDA", "Anulación de devolución", cantidad,
                   f"ANUL-DEV-{rid}", motivo)
+        _eliminar_definitivo(con, "devoluciones", rid, motivo)
     _transaccion_anulacion(_op)
 
 def anular_despacho(rid, motivo):
     def _op(con):
-        if con.execute("SELECT COUNT(*) FROM devoluciones WHERE despacho_id=? AND anulado=0",
+        if con.execute("SELECT COUNT(*) FROM devoluciones WHERE despacho_id=?",
                        (rid,)).fetchone()[0]:
-            raise ValueError("Ese despacho tiene devoluciones registradas: anúlalas primero.")
+            raise ValueError("Ese despacho tiene devoluciones registradas (vigentes o eliminadas): "
+                             "primero elimínalas o anúlalas.")
         _marcar_anulado(con, "pedidos", rid, motivo)
         pid, despachada = con.execute(
             "SELECT producto_id, cant_despachada FROM pedidos WHERE id=?", (rid,)).fetchone()
@@ -576,16 +595,16 @@ def anular_despacho(rid, motivo):
 
 def anular_conteo(rid, motivo):
     def _op(con):
-        _marcar_anulado(con, "conteos", rid, motivo)
         pid, dif, ajustado = con.execute(
             "SELECT producto_id, diferencia, ajustado FROM conteos WHERE id=?", (rid,)).fetchone()
         if ajustado and abs(dif) > 1e-9:
             mover(con, date.today(), pid, "SALIDA" if dif > 0 else "ENTRADA",
                   "Anulación de ajuste por conteo", abs(dif), f"ANUL-CONTEO-{rid}", motivo)
+        _eliminar_definitivo(con, "conteos", rid, motivo)
     _transaccion_anulacion(_op)
 
 def anular_pasteurizacion(rid, motivo):
-    transaccion(lambda con: _marcar_anulado(con, "pasteurizacion", rid, motivo))
+    transaccion(lambda con: _eliminar_definitivo(con, "pasteurizacion", rid, motivo))
 
 def registrar_programacion(fecha, lote, pid, litros, responsable_id=None, observacion=None):
     if litros <= 0:
@@ -595,7 +614,7 @@ def registrar_programacion(fecha, lote, pid, litros, responsable_id=None, observ
         "VALUES (?,?,?,?,?,?)", (str(fecha), lote, pid, litros, responsable_id, observacion)))
 
 def anular_programacion(rid, motivo):
-    transaccion(lambda con: _marcar_anulado(con, "programacion", rid, motivo))
+    transaccion(lambda con: _eliminar_definitivo(con, "programacion", rid, motivo))
 
 def registrar_salida_planta(fecha, lote, pid, cantidad, unidades=None, n_jabas=None,
                             documento=None, observacion=None):
@@ -624,11 +643,11 @@ def registrar_salida_planta(fecha, lote, pid, cantidad, unidades=None, n_jabas=N
 
 def anular_salida_planta(rid, motivo):
     def _op(con):
-        _marcar_anulado(con, "salida_planta", rid, motivo)
         pid, cantidad, lote = con.execute(
             "SELECT producto_id, cantidad, lote FROM salida_planta WHERE id=?", (rid,)).fetchone()
         mover(con, date.today(), pid, "SALIDA", "Anulación de salida de planta", cantidad,
               f"ANUL-SAL-{rid}", motivo)
+        _eliminar_definitivo(con, "salida_planta", rid, motivo)
     _transaccion_anulacion(_op)
 
 def actualizar_trazabilidad(rid, fecha_maduracion=None, fecha_empaque=None, fecha_envasado=None,
@@ -775,7 +794,9 @@ def anular_pedido_cliente(rid, motivo):
         if con.execute("SELECT 1 FROM pedidos WHERE pedido_cliente_id=? AND anulado=0",
                        (rid,)).fetchone():
             raise ValueError("Ese pedido ya tiene despachos asociados: anúlalos primero.")
-        _marcar_anulado(con, "pedidos_cliente", rid, motivo)
+        def _antes(con):
+            con.execute("UPDATE pedidos SET pedido_cliente_id=NULL WHERE pedido_cliente_id=?", (rid,))
+        _eliminar_definitivo(con, "pedidos_cliente", rid, motivo, antes=_antes)
     transaccion(_op)
 
 def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento, destino_id=None,
@@ -951,11 +972,17 @@ def pick_proveedor():
     opts = dict(zip(df.id.tolist(), df.nombre.tolist()))
     return st.selectbox("Proveedor", list(opts), format_func=opts.get)
 
-def pick_operador(label="Operador", obligatorio=True, key=None):
-    df = q("SELECT id, nombre FROM operadores WHERE activo=1 ORDER BY nombre")
+def pick_operador(label="Operador", obligatorio=True, key=None, area=None):
+    sql = "SELECT id, nombre FROM operadores WHERE activo=1"
+    params = ()
+    if area:
+        sql += " AND area = ?"
+        params = (area,)
+    df = q(sql + " ORDER BY nombre", params)
     if df.empty:
         if obligatorio:
-            st.info("Registra primero a los operadores en «Catálogos» → «Operadores».")
+            donde = f" de {area.lower()}" if area else ""
+            st.info(f"Registra primero a los operadores{donde} en «Catálogos» → «Operadores».")
         return None
     opts = dict(zip(df.id.tolist(), df.nombre.tolist()))
     ids = list(opts) if obligatorio else [None] + list(opts)
@@ -1131,25 +1158,28 @@ def pag_catalogos():
         st.dataframe(prov.drop(columns="id"), width="stretch", hide_index=True)
     with t3:
         with st.form("f_oper", clear_on_submit=True):
-            o1, o2 = st.columns(2)
+            o1, o2, o3 = st.columns(3)
             on = o1.text_input("Nombre del operador")
             oc = o2.text_input("Cargo (ej. Operador de pasteurización)")
+            oa = o3.selectbox("Área", ["Planta", "Tienda"])
             if st.form_submit_button("Agregar operador"):
                 def _addo():
                     if not on.strip():
                         raise ValueError("El nombre es obligatorio.")
                     con = get_conn()
-                    con.execute("INSERT INTO operadores (nombre, cargo) VALUES (?,?)", (on.strip(), oc.strip()))
+                    con.execute("INSERT INTO operadores (nombre, cargo, area) VALUES (?,?,?)",
+                               (on.strip(), oc.strip(), oa))
                     con.commit()
                     con.close()
                 guardar(_addo)
-        sql_ops = """SELECT o.id, o.nombre, COALESCE(o.cargo, '') AS cargo,
+        sql_ops = """SELECT o.id, o.nombre, COALESCE(o.cargo, '') AS cargo, o.area,
                             (SELECT COUNT(*) FROM pasteurizacion p WHERE p.operador_id = o.id) +
                             (SELECT COUNT(*) FROM produccion pr WHERE pr.operador_id = o.id) AS registros
-                     FROM operadores o WHERE o.activo = {activo} ORDER BY o.nombre, o.id"""
+                     FROM operadores o WHERE o.activo = {activo} ORDER BY o.area, o.nombre, o.id"""
         def etiquetas_ops(df):
-            return dict(zip(df.id.tolist(), (df.nombre + " · cargo: " + df.cargo.replace("", "(sin cargo)")
-                                             + " · " + df.registros.astype(str) + " registros").tolist()))
+            return dict(zip(df.id.tolist(), (df.nombre + " · " + df.area + " · cargo: " +
+                                             df.cargo.replace("", "(sin cargo)") +
+                                             " · " + df.registros.astype(str) + " registros").tolist()))
         ops = q(sql_ops.format(activo=1))
         if not ops.empty:
             with st.expander("Dar de baja a un operador (ya no trabaja en la planta)"):
@@ -1243,24 +1273,36 @@ def bloque_destinos():
                     guardar(reactivar_destino, sel_r, ok="Destino reactivado.")
     st.dataframe(q(sql.format(activo=1)).drop(columns="id"), width="stretch", hide_index=True)
 
-def form_anular(key, vigentes, fn):
+def form_anular(key, vigentes, fn, modo="eliminar"):
+    """modo='eliminar': borra el registro por completo (si movió inventario, el Kardex se corrige
+    con un movimiento contrario, pero el registro desaparece de su propia lista).
+    modo='anular': lo deja marcado como ANULADO en vez de borrarlo (se usa solo en Despachos)."""
     if vigentes.empty:
         return
-    with st.expander("Anular un registro (corregir un error)"):
-        st.caption("El registro no se borra: queda marcado como ANULADO con su motivo y, si movió "
-                   "inventario, el Kardex se corrige solo. Luego vuelve a registrarlo bien.")
+    if modo == "eliminar":
+        titulo, boton, ok_msg = "Eliminar un registro (corregir un error)", "Eliminar registro", "Registro eliminado."
+        texto = ("Esto borra el registro por completo; no queda en la lista. Si movió inventario, el "
+                 "Kardex se corrige con un movimiento contrario. Esta acción no se puede deshacer.")
+        etiqueta_sel, etiqueta_motivo, etiqueta_ok = "Registro a eliminar", "Motivo (obligatorio)", "Confirmo que quiero eliminarlo"
+    else:
+        titulo, boton, ok_msg = "Anular un registro (corregir un error)", "Anular registro", "Registro anulado."
+        texto = ("El registro no se borra: queda marcado como ANULADO con su motivo y, si movió "
+                 "inventario, el Kardex se corrige solo. Luego vuelve a registrarlo bien.")
+        etiqueta_sel, etiqueta_motivo, etiqueta_ok = "Registro a anular", "Motivo (obligatorio)", "Confirmo que quiero anularlo"
+    with st.expander(titulo):
+        st.caption(texto)
         opts = dict(zip(vigentes.id.tolist(), vigentes.etiqueta.tolist()))
         with st.form(f"f_anular_{key}"):
-            sel = st.selectbox("Registro a anular", list(opts), format_func=opts.get)
-            motivo = st.text_input("Motivo (obligatorio)")
-            ok_ = st.checkbox("Confirmo que quiero anularlo")
-            if st.form_submit_button("Anular registro"):
+            sel = st.selectbox(etiqueta_sel, list(opts), format_func=opts.get)
+            motivo = st.text_input(etiqueta_motivo)
+            ok_ = st.checkbox(etiqueta_ok)
+            if st.form_submit_button(boton):
                 if not motivo.strip():
-                    st.error("Escribe el motivo de la anulación.")
+                    st.error("Escribe el motivo.")
                 elif not ok_:
                     st.error("Marca la casilla de confirmación.")
                 else:
-                    guardar(fn, sel, motivo.strip(), ok="Registro anulado.")
+                    guardar(fn, sel, motivo.strip(), ok=ok_msg)
 
 def pag_recepcion():
     st.header("Llegada y análisis de leche")
@@ -1293,7 +1335,7 @@ def pag_recepcion():
         st.caption("Leche aceptada: déjala en 0 para que se calcule sola (litros recibidos − agua). "
                    "Solo la leche aceptada entra al inventario.")
         aprobada = st.checkbox("Aprobada por control de calidad", value=True)
-        resp = pick_operador("Responsable del análisis (opcional)", obligatorio=False)
+        resp = pick_operador("Responsable del análisis (opcional)", obligatorio=False, area="Planta")
         if st.form_submit_button("Registrar recepción"):
             if prov is None:
                 st.error("Falta el proveedor: agrégalo primero en Catálogos → Proveedores.")
@@ -1317,9 +1359,7 @@ def pag_recepcion():
                       r.temperatura, r.ph, r.lactosa, r.proteina, r.sng, r.mastitis,
                       r.antibioticos, r.agua_l, r.litros_aceptados AS aceptada_L,
                       CASE r.aprobada WHEN 1 THEN 'Sí' ELSE 'No' END AS aprobada,
-                      o.nombre AS responsable,
-                      CASE r.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
-                      r.motivo_anulacion
+                      o.nombre AS responsable
                       FROM recepcion_leche r LEFT JOIN proveedores v ON v.id = r.proveedor_id
                       LEFT JOIN operadores o ON o.id = r.responsable_id
                       ORDER BY r.fecha DESC, r.id DESC"""),
@@ -1354,7 +1394,7 @@ def pag_pasteurizacion():
         litros = c4.number_input("Litros pasteurizados", min_value=0.0, step=10.0)
         temp = c5.number_input("Temperatura alcanzada (°C)", min_value=0.0, step=0.5)
         tiempo = c6.number_input("Tiempo de retención (min)", min_value=0.0, step=1.0)
-        oper = pick_operador("Operador responsable", obligatorio=True)
+        oper = pick_operador("Operador responsable", obligatorio=True, area="Planta")
         prod_p = pick_producto_opcional("Producto que se elabora (opcional)", ["Producto terminado"])
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar pasteurización"):
@@ -1379,8 +1419,7 @@ def pag_pasteurizacion():
                      ps.temperatura,
                      ps.tiempo_min AS "tiempo_min", o.nombre AS operador,
                      CASE ps.conforme WHEN 1 THEN 'Conforme' ELSE 'NO conforme' END AS resultado,
-                     CASE ps.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
-                     ps.motivo_anulacion, ps.observacion
+                     ps.observacion
               FROM pasteurizacion ps JOIN operadores o ON o.id = ps.operador_id
               LEFT JOIN productos pp ON pp.id = ps.producto_id
               ORDER BY ps.fecha DESC, ps.id DESC""")
@@ -1395,7 +1434,7 @@ def pag_produccion():
         f = c1.date_input("Fecha", date.today())
         lote = c2.text_input("Lote")
         pid = pick_producto("Producto elaborado", ["Producto terminado"])
-        oper = pick_operador("Operador (opcional)", obligatorio=False)
+        oper = pick_operador("Operador (opcional)", obligatorio=False, area="Planta")
         litros = st.number_input("Litros de leche usados (0 si el producto no lleva leche)",
                                  min_value=0.0, step=10.0)
         st.caption("Suero: recibido → vendido / usado → la diferencia es la merma.")
@@ -1441,9 +1480,7 @@ def pag_produccion():
                      sp.cantidad AS cantidad_salida_planta,
                      ROUND(sp.cantidad * 100.0 / pr.litros_leche, 2) AS "recuperación_%",
                      pr.suero_obtenido, pr.suero_vendido, pr.suero_usado,
-                     pr.suero_obtenido - pr.suero_vendido - pr.suero_usado AS merma_suero_L,
-                     CASE pr.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
-                     pr.motivo_anulacion
+                     pr.suero_obtenido - pr.suero_vendido - pr.suero_usado AS merma_suero_L
               FROM produccion pr JOIN productos p ON p.id = pr.producto_id
               LEFT JOIN operadores o ON o.id = pr.operador_id
               LEFT JOIN salida_planta sp ON sp.lote = pr.lote AND sp.producto_id = pr.producto_id
@@ -1503,8 +1540,7 @@ def pag_salida_planta():
                                FROM salida_planta sp JOIN productos p ON p.id = sp.producto_id
                                WHERE sp.anulado = 0 ORDER BY sp.id DESC LIMIT 100"""), anular_salida_planta)
     st.dataframe(q("""SELECT sp.id AS n, sp.fecha, sp.lote, p.nombre AS producto, sp.cantidad, p.unidad,
-                      sp.unidades, sp.n_jabas, sp.documento, sp.observacion,
-                      CASE sp.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado, sp.motivo_anulacion
+                      sp.unidades, sp.n_jabas, sp.documento, sp.observacion
                       FROM salida_planta sp JOIN productos p ON p.id = sp.producto_id
                       ORDER BY sp.fecha DESC, sp.id DESC"""),
                  width="stretch", hide_index=True)
@@ -1522,7 +1558,7 @@ def pag_pedidos_cliente():
         destino = pick_destino("Tienda que pide")
         cliente = st.text_input("Cliente (si no es una tienda)")
         cant = st.number_input("Cantidad solicitada", min_value=0.0, step=1.0)
-        resp = pick_operador("Quién tomó el pedido (opcional)", obligatorio=False)
+        resp = pick_operador("Quién tomó el pedido (opcional)", obligatorio=False, area="Tienda")
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar pedido"):
             guardar(registrar_pedido_cliente, f, destino, cliente.strip(), pid, cant, resp,
@@ -1540,8 +1576,7 @@ def pag_pedidos_cliente():
                                 WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS atendido,
                       pc.cantidad_solicitada - COALESCE((SELECT SUM(pe.cant_despachada) FROM pedidos pe
                                 WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS pendiente,
-                      o.nombre AS tomado_por, pc.observacion,
-                      CASE pc.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado, pc.motivo_anulacion
+                      o.nombre AS tomado_por, pc.observacion
                       FROM pedidos_cliente pc JOIN productos p ON p.id = pc.producto_id
                       LEFT JOIN destinos d ON d.id = pc.destino_id
                       LEFT JOIN operadores o ON o.id = pc.responsable_id
@@ -1593,7 +1628,7 @@ def pag_despachos():
         pedida = c3.number_input("Cantidad pedida", min_value=0.0, step=1.0)
         desp = c4.number_input("Cantidad despachada", min_value=0.0, step=1.0)
         doc = c5.text_input("N° de guía")
-        resp = pick_operador("Responsable del envío (opcional)", obligatorio=False)
+        resp = pick_operador("Responsable del envío (opcional)", obligatorio=False, area="Tienda")
         if st.form_submit_button("Registrar despacho"):
             if pedida <= 0:
                 st.error("La cantidad pedida es obligatoria.")
@@ -1607,7 +1642,7 @@ def pag_despachos():
     form_anular("desp", q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' ||
                                     p.nombre || ' · ' || d.cant_despachada AS etiqueta
                              FROM pedidos d JOIN productos p ON p.id = d.producto_id
-                             WHERE d.anulado = 0 ORDER BY d.id DESC LIMIT 100"""), anular_despacho)
+                             WHERE d.anulado = 0 ORDER BY d.id DESC LIMIT 100"""), anular_despacho, modo="anular")
     st.dataframe(q("""SELECT d.id AS n, d.fecha, d.cliente, p.nombre AS producto, d.lote,
                       op_prod.nombre AS quien_produjo_el_lote, d.pedido_cliente_id AS pedido_cliente,
                       d.cant_pedida, d.cant_despachada,
@@ -1648,7 +1683,7 @@ def pag_devoluciones():
         destino_prod = c6.selectbox("¿Qué pasa con el producto?", [DESTINO_REINGRESO, DESTINO_MERMA])
         st.caption("«Reingresa al almacén» suma la cantidad al stock. «Merma» queda registrada, "
                    "pero no vuelve al stock.")
-        resp = pick_operador("Operador que recepciona la devolución en planta", obligatorio=True, key="resp_dev")
+        resp = pick_operador("Operador que recepciona la devolución en planta", obligatorio=True, key="resp_dev", area="Planta")
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar devolución"):
             guardar(registrar_devolucion, f, cliente.strip(), pid, cant, motivo, destino_prod, origen,
@@ -1662,9 +1697,7 @@ def pag_devoluciones():
                       dv.cantidad, dv.motivo, dv.destino AS destino_producto,
                       op_prod.nombre AS operador_que_produjo,
                       op_rec.nombre AS responsable_recepcion,
-                      dv.documento, dv.observacion,
-                      CASE dv.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
-                      dv.motivo_anulacion
+                      dv.documento, dv.observacion
                       FROM devoluciones dv
                       JOIN productos p ON p.id = dv.producto_id
                       LEFT JOIN operadores op_rec ON op_rec.id = dv.responsable_id
@@ -1682,7 +1715,7 @@ def pag_programacion():
         lote = c2.text_input("N° de Lote")
         litros = c3.number_input("Litros de leche programados", min_value=0.0, step=10.0)
         pid = pick_producto("Producto a elaborar (Código - Nombre)", ["Producto terminado"])
-        oper = pick_operador("Operador responsable (opcional)", obligatorio=False)
+        oper = pick_operador("Operador responsable (opcional)", obligatorio=False, area="Planta")
         obs = st.text_input("Observaciones (opcional)")
         if st.form_submit_button("Registrar programación"):
             guardar(registrar_programacion, f, lote.strip() or None, pid, litros, oper, obs.strip() or None)
@@ -1839,9 +1872,7 @@ def pag_conteo():
                                FROM conteos c JOIN productos p ON p.id = c.producto_id
                                WHERE c.anulado = 0 ORDER BY c.id DESC LIMIT 100"""), anular_conteo)
     st.dataframe(q("""SELECT c.id AS n, c.fecha, p.nombre AS producto, c.stock_sistema, c.stock_fisico,
-                      c.diferencia, CASE c.ajustado WHEN 1 THEN 'Sí' ELSE 'No' END AS ajustó_kardex,
-                      CASE c.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
-                      c.motivo_anulacion
+                      c.diferencia, CASE c.ajustado WHEN 1 THEN 'Sí' ELSE 'No' END AS ajustó_kardex
                       FROM conteos c JOIN productos p ON p.id = c.producto_id
                       ORDER BY c.fecha DESC, c.id DESC"""),
                  width="stretch", hide_index=True)
