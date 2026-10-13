@@ -460,8 +460,6 @@ def registrar_produccion(fecha, lote, pid, litros, suero, s_vendido, s_usado,
         leche, suero_id = producto_id(con, "MP-LECHE"), producto_id(con, "SB-SUERO")
         if litros > 0:
             mover(con, fecha, leche, "SALIDA", "Consumo en producción", litros, lote)
-        # El producto terminado NO entra al Kardex aquí: todavía no se pesa ni se cuenta.
-        # Entra cuando se registra su «Salida de planta» (peso, unidades y jabas reales).
         if suero > 0:
             mover(con, fecha, suero_id, "ENTRADA", "Suero de producción", suero, lote)
         if s_vendido > 0:
@@ -504,11 +502,6 @@ def _marcar_anulado(con, tabla, rid, motivo):
     con.execute(f"UPDATE {tabla} SET anulado=1, motivo_anulacion=? WHERE id=?", (motivo.strip(), rid))
 
 def _eliminar_definitivo(con, tabla, rid, motivo, antes=None):
-    """Borra el registro por completo (en vez de solo marcarlo anulado). Si la tabla tuvo un
-    movimiento de Kardex, la función que llama debe generar antes el movimiento contrario, pasando
-    el motivo como observación, para que quede el rastro en el Kardex aunque el registro desaparezca
-    de su propia lista. `antes`, si se da, corre justo antes del DELETE (para limpiar referencias
-    de otras tablas, como un despacho o devolución que apuntaba a este registro)."""
     if not motivo or not motivo.strip():
         raise ValueError("El motivo es obligatorio.")
     fila = con.execute(f"SELECT 1 FROM {tabla} WHERE id=?", (rid,)).fetchone()
@@ -523,8 +516,8 @@ def _transaccion_anulacion(fn):
         transaccion(fn)
     except ValueError as e:
         if str(e).startswith("Stock insuficiente"):
-            raise ValueError(f"No se puede anular: {e} Probablemente ese producto ya se despachó o "
-                             "se usó; anula primero ese otro registro.") from None
+            raise ValueError(f"No se puede eliminar: {e} Probablemente ese producto ya se usó "
+                             "en otra operación; revisa el inventario.") from None
         raise
 
 def anular_recepcion(rid, motivo):
@@ -543,7 +536,7 @@ def anular_produccion(rid, motivo):
         lote, pid0 = con.execute("SELECT lote, producto_id FROM produccion WHERE id=?", (rid,)).fetchone()
         if con.execute("SELECT 1 FROM salida_planta WHERE lote = ? COLLATE NOCASE AND producto_id = ? "
                        "AND anulado = 0", (lote, pid0)).fetchone():
-            raise ValueError("Ese lote ya tiene registrada su salida de planta: anula primero esa "
+            raise ValueError("Ese lote ya tiene registrada su salida de planta: elimina primero esa "
                              "salida de planta.")
         pid, litros, obtenida, suero, vendido, usado, con_merma = con.execute(
             "SELECT producto_id, litros_leche, cantidad_obtenida, suero_obtenido, suero_vendido, "
@@ -561,7 +554,7 @@ def anular_produccion(rid, motivo):
             mover(con, hoy, suero_id, "ENTRADA", mot, merma, doc, motivo)
         if suero > 0:
             mover(con, hoy, suero_id, "SALIDA", mot, suero, doc, motivo)
-        if obtenida > 1e-9:  # dato antiguo (versiones previas sí movían stock aquí)
+        if obtenida > 1e-9:
             mover(con, hoy, pid, "SALIDA", mot, obtenida, doc, motivo)
         def _antes(con):
             con.execute("DELETE FROM produccion_insumos WHERE produccion_id=?", (rid,))
@@ -579,18 +572,18 @@ def anular_devolucion(rid, motivo):
         _eliminar_definitivo(con, "devoluciones", rid, motivo)
     _transaccion_anulacion(_op)
 
-def anular_despacho(rid, motivo):
+def eliminar_despacho(rid, motivo):
     def _op(con):
         if con.execute("SELECT COUNT(*) FROM devoluciones WHERE despacho_id=?",
                        (rid,)).fetchone()[0]:
-            raise ValueError("Ese despacho tiene devoluciones registradas (vigentes o eliminadas): "
-                             "primero elimínalas o anúlalas.")
-        _marcar_anulado(con, "pedidos", rid, motivo)
+            raise ValueError("Ese despacho tiene devoluciones registradas: "
+                             "primero elimina esas devoluciones.")
         pid, despachada = con.execute(
             "SELECT producto_id, cant_despachada FROM pedidos WHERE id=?", (rid,)).fetchone()
         if despachada > 0:
-            mover(con, date.today(), pid, "ENTRADA", "Anulación de despacho", despachada,
-                  f"ANUL-DESP-{rid}", motivo)
+            mover(con, date.today(), pid, "ENTRADA", "Eliminación de despacho", despachada,
+                  f"DEL-DESP-{rid}", motivo)
+        _eliminar_definitivo(con, "pedidos", rid, motivo)
     _transaccion_anulacion(_op)
 
 def anular_conteo(rid, motivo):
@@ -618,7 +611,6 @@ def anular_programacion(rid, motivo):
 
 def registrar_salida_planta(fecha, lote, pid, cantidad, unidades=None, n_jabas=None,
                             documento=None, observacion=None):
-    """Es aquí donde el producto se pesa y se cuenta de verdad, y entra al Kardex con esa cifra real."""
     if cantidad <= 0:
         raise ValueError("La cantidad (peso) debe ser mayor que cero.")
     if not (lote or "").strip():
@@ -791,9 +783,9 @@ def registrar_pedido_cliente(fecha, destino_id, cliente, pid, cantidad, responsa
 
 def anular_pedido_cliente(rid, motivo):
     def _op(con):
-        if con.execute("SELECT 1 FROM pedidos WHERE pedido_cliente_id=? AND anulado=0",
+        if con.execute("SELECT 1 FROM pedidos WHERE pedido_cliente_id=?",
                        (rid,)).fetchone():
-            raise ValueError("Ese pedido ya tiene despachos asociados: anúlalos primero.")
+            raise ValueError("Ese pedido ya tiene despachos asociados: bórralos primero.")
         def _antes(con):
             con.execute("UPDATE pedidos SET pedido_cliente_id=NULL WHERE pedido_cliente_id=?", (rid,))
         _eliminar_definitivo(con, "pedidos_cliente", rid, motivo, antes=_antes)
@@ -815,7 +807,7 @@ def registrar_despacho(fecha, cliente, pid, pedida, despachada, documento, desti
             if pc[0] != pid:
                 raise ValueError("El producto del despacho no coincide con el del pedido elegido.")
             ya = con.execute("SELECT COALESCE(SUM(cant_despachada), 0) FROM pedidos "
-                             "WHERE pedido_cliente_id=? AND anulado=0", (pedido_cliente_id,)).fetchone()[0]
+                             "WHERE pedido_cliente_id=?", (pedido_cliente_id,)).fetchone()[0]
             if ya + despachada > pc[1] + 1e-9:
                 raise ValueError(f"Ese pedido fue de {pc[1]:g} y ya se atendieron {ya:g}; "
                                  f"no se pueden despachar {despachada:g} más.")
@@ -840,14 +832,14 @@ def registrar_devolucion(fecha, cliente, pid, cantidad, motivo, destino, despach
         if despacho_id is None and destino_id is not None:
             cli = _nombre_destino(con, destino_id)
         if despacho_id is not None:
-            fila = con.execute("SELECT cliente, producto_id, cant_despachada, anulado "
+            fila = con.execute("SELECT cliente, producto_id, cant_despachada "
                                "FROM pedidos WHERE id=?", (despacho_id,)).fetchone()
-            if fila is None or fila[3]:
-                raise ValueError("El despacho elegido no existe o está anulado.")
+            if fila is None:
+                raise ValueError("El despacho elegido no existe.")
             cli, prod, despachada = fila[0], fila[1], fila[2]
             dest_id = con.execute("SELECT destino_id FROM pedidos WHERE id=?", (despacho_id,)).fetchone()[0]
             ya = con.execute("SELECT COALESCE(SUM(cantidad), 0) FROM devoluciones "
-                             "WHERE despacho_id=? AND anulado=0", (despacho_id,)).fetchone()[0]
+                             "WHERE despacho_id=?", (despacho_id,)).fetchone()[0]
             if cantidad + ya > despachada + 1e-9:
                 raise ValueError(f"Ese despacho fue de {despachada:g} y ya se devolvieron {ya:g}; "
                                  f"no se pueden devolver {cantidad:g} más.")
@@ -899,13 +891,12 @@ def kardex(producto=None):
     return df
 
 def indicadores(desde, hasta):
-    """Indicadores de la tesis: control de existencias, exactitud, fill rate y suero desechado."""
     d, h = str(desde), str(hasta)
     out = {}
     mv = q("""SELECT COUNT(*) AS total,
                      COALESCE(SUM(CASE WHEN documento IS NOT NULL AND TRIM(documento) <> '' THEN 1 ELSE 0 END), 0)
                      AS identificados
-              FROM movimientos WHERE fecha BETWEEN ? AND ? AND motivo NOT LIKE 'Anulación%'""", (d, h))
+              FROM movimientos WHERE fecha BETWEEN ? AND ? AND motivo NOT LIKE 'Anulación%' AND motivo NOT LIKE 'Eliminación%'""", (d, h))
     out["control_existencias"] = (mv.identificados[0] / mv.total[0] * 100) if mv.total[0] else None
 
     c = q("SELECT stock_sistema, stock_fisico FROM conteos WHERE fecha BETWEEN ? AND ? AND anulado = 0",
@@ -914,11 +905,9 @@ def indicadores(desde, hasta):
     out["exactitud"] = (c.stock_fisico.sum() / teorico * 100) if len(c) and teorico else None
     out["conteos_periodo"] = len(c)
 
-    # Fill rate = lo atendido (despachos ligados a un pedido de cliente) ÷ lo solicitado por esos pedidos.
-    # Así, un pedido que nunca se despachó (demanda no atendida) también cuenta en el denominador.
     pc = q("""SELECT pc.id, pc.cantidad_solicitada,
                      COALESCE((SELECT SUM(pe.cant_despachada) FROM pedidos pe
-                               WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS atendido
+                               WHERE pe.pedido_cliente_id = pc.id), 0) AS atendido
               FROM pedidos_cliente pc
               WHERE pc.fecha BETWEEN ? AND ? AND pc.anulado = 0""", (d, h))
     solicitado_total = pc.cantidad_solicitada.sum() if len(pc) else 0
@@ -926,7 +915,7 @@ def indicadores(desde, hasta):
     out["pedidos_cliente_periodo"] = len(pc)
 
     desp_tot = q("SELECT COALESCE(SUM(cant_despachada), 0) AS des FROM pedidos "
-                 "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
+                 "WHERE fecha BETWEEN ? AND ?", (d, h))
     despachado = desp_tot.des[0]
 
     pr = q("""SELECT p.nombre, SUM(pr.litros_leche) leche, SUM(COALESCE(sp.cantidad, 0)) obtenido,
@@ -949,7 +938,7 @@ def indicadores(desde, hasta):
     out["pasteurizaciones"] = len(pa)
 
     dv = q("SELECT COALESCE(SUM(cantidad), 0) AS dev FROM devoluciones "
-           "WHERE fecha BETWEEN ? AND ? AND anulado = 0", (d, h))
+           "WHERE fecha BETWEEN ? AND ?", (d, h))
     out["devuelto"] = float(dv.dev[0])
     out["tasa_devoluciones"] = (dv.dev[0] / despachado * 100
                                 if despachado is not None and pd.notna(despachado) and despachado > 0
@@ -1274,21 +1263,12 @@ def bloque_destinos():
     st.dataframe(q(sql.format(activo=1)).drop(columns="id"), width="stretch", hide_index=True)
 
 def form_anular(key, vigentes, fn, modo="eliminar"):
-    """modo='eliminar': borra el registro por completo (si movió inventario, el Kardex se corrige
-    con un movimiento contrario, pero el registro desaparece de su propia lista).
-    modo='anular': lo deja marcado como ANULADO en vez de borrarlo (se usa solo en Despachos)."""
     if vigentes.empty:
         return
-    if modo == "eliminar":
-        titulo, boton, ok_msg = "Eliminar un registro (corregir un error)", "Eliminar registro", "Registro eliminado."
-        texto = ("Esto borra el registro por completo; no queda en la lista. Si movió inventario, el "
-                 "Kardex se corrige con un movimiento contrario. Esta acción no se puede deshacer.")
-        etiqueta_sel, etiqueta_motivo, etiqueta_ok = "Registro a eliminar", "Motivo (obligatorio)", "Confirmo que quiero eliminarlo"
-    else:
-        titulo, boton, ok_msg = "Anular un registro (corregir un error)", "Anular registro", "Registro anulado."
-        texto = ("El registro no se borra: queda marcado como ANULADO con su motivo y, si movió "
-                 "inventario, el Kardex se corrige solo. Luego vuelve a registrarlo bien.")
-        etiqueta_sel, etiqueta_motivo, etiqueta_ok = "Registro a anular", "Motivo (obligatorio)", "Confirmo que quiero anularlo"
+    titulo, boton, ok_msg = "Eliminar un registro (corregir un error)", "Eliminar registro", "Registro eliminado."
+    texto = ("Esto borra el registro por completo; no queda en la lista. Si movió inventario, el "
+             "Kardex se corrige con un movimiento contrario. Esta acción no se puede deshacer.")
+    etiqueta_sel, etiqueta_motivo, etiqueta_ok = "Registro a eliminar", "Motivo (obligatorio)", "Confirmo que quiero eliminarlo"
     with st.expander(titulo):
         st.caption(texto)
         opts = dict(zip(vigentes.id.tolist(), vigentes.etiqueta.tolist()))
@@ -1573,9 +1553,9 @@ def pag_pedidos_cliente():
     st.dataframe(q("""SELECT pc.id AS n, pc.fecha, COALESCE(d.nombre, pc.cliente, 's/cliente') AS tienda_cliente,
                       p.nombre AS producto, pc.cantidad_solicitada,
                       COALESCE((SELECT SUM(pe.cant_despachada) FROM pedidos pe
-                                WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS atendido,
+                                WHERE pe.pedido_cliente_id = pc.id), 0) AS atendido,
                       pc.cantidad_solicitada - COALESCE((SELECT SUM(pe.cant_despachada) FROM pedidos pe
-                                WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0) AS pendiente,
+                                WHERE pe.pedido_cliente_id = pc.id), 0) AS pendiente,
                       o.nombre AS tomado_por, pc.observacion
                       FROM pedidos_cliente pc JOIN productos p ON p.id = pc.producto_id
                       LEFT JOIN destinos d ON d.id = pc.destino_id
@@ -1604,12 +1584,12 @@ def pag_despachos():
                                   COALESCE(d.nombre, pc.cliente, 's/cliente') || ' · pidió ' ||
                                   pc.cantidad_solicitada || ', faltan ' ||
                                   (pc.cantidad_solicitada - COALESCE((SELECT SUM(pe.cant_despachada)
-                                   FROM pedidos pe WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0))
+                                   FROM pedidos pe WHERE pe.pedido_cliente_id = pc.id), 0))
                                   AS etiqueta
                            FROM pedidos_cliente pc LEFT JOIN destinos d ON d.id = pc.destino_id
                            WHERE pc.anulado = 0 AND pc.producto_id = ?
                              AND pc.cantidad_solicitada > COALESCE((SELECT SUM(pe.cant_despachada)
-                                 FROM pedidos pe WHERE pe.pedido_cliente_id = pc.id AND pe.anulado = 0), 0)
+                                 FROM pedidos pe WHERE pe.pedido_cliente_id = pc.id), 0)
                            ORDER BY pc.fecha LIMIT 100""", (pid_sel,)) if pid_sel else q("SELECT 1 WHERE 0")
     opts_pedcli = dict(zip(pedidos_pend_df.id.tolist(), pedidos_pend_df.etiqueta.tolist())) if not pedidos_pend_df.empty else {}
     with st.form("f_desp", clear_on_submit=True):
@@ -1642,14 +1622,12 @@ def pag_despachos():
     form_anular("desp", q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' ||
                                     p.nombre || ' · ' || d.cant_despachada AS etiqueta
                              FROM pedidos d JOIN productos p ON p.id = d.producto_id
-                             WHERE d.anulado = 0 ORDER BY d.id DESC LIMIT 100"""), anular_despacho, modo="anular")
+                             ORDER BY d.id DESC LIMIT 100"""), eliminar_despacho)
     st.dataframe(q("""SELECT d.id AS n, d.fecha, d.cliente, p.nombre AS producto, d.lote,
                       op_prod.nombre AS quien_produjo_el_lote, d.pedido_cliente_id AS pedido_cliente,
                       d.cant_pedida, d.cant_despachada,
                       ROUND(d.cant_despachada * 100.0 / d.cant_pedida, 1) AS "fill_rate_%",
-                      d.documento, o.nombre AS responsable_envio,
-                      CASE d.anulado WHEN 1 THEN 'ANULADO' ELSE 'Vigente' END AS estado,
-                      d.motivo_anulacion
+                      d.documento, o.nombre AS responsable_envio
                       FROM pedidos d JOIN productos p ON p.id = d.producto_id
                       LEFT JOIN operadores o ON o.id = d.responsable_envio_id
                       LEFT JOIN produccion pr ON pr.lote = d.lote AND pr.producto_id = d.producto_id
@@ -1660,15 +1638,15 @@ def pag_despachos():
 def pag_devoluciones():
     st.header("Pedidos devueltos")
     desp = q("""SELECT d.id, 'N°' || d.id || ' · ' || d.fecha || ' · ' || d.cliente || ' · ' || p.nombre ||
-                       ' · despachado ' || d.cant_despachada AS etiqueta
+                       ' · lote: ' || COALESCE(d.lote, 's/lote') || ' · despachado ' || d.cant_despachada AS etiqueta
                 FROM pedidos d JOIN productos p ON p.id = d.producto_id
-                WHERE d.anulado = 0 AND d.cant_despachada > 0 ORDER BY d.id DESC LIMIT 100""")
+                ORDER BY d.id DESC LIMIT 100""")
     opts_d = dict(zip(desp.id.tolist(), desp.etiqueta.tolist()))
     with st.form("f_dev", clear_on_submit=True):
         origen = st.selectbox("Despacho de origen (opcional)", [None] + list(opts_d),
                               format_func=lambda i: opts_d.get(i, "(sin despacho de origen)"))
-        st.caption("Si eliges un despacho que tenía un lote asociado, se identificará automáticamente el "
-                   "operador que produjo ese lote. Si el despacho no tenía lote, no se podrá identificar.")
+        st.caption("Si eliges un despacho, el sistema identificará automáticamente el lote y el operador "
+                   "responsable que elaboró ese producto en la planta.")
         c1, c2 = st.columns(2)
         f = c1.date_input("Fecha de devolución", date.today())
         with c2:
@@ -1691,11 +1669,11 @@ def pag_devoluciones():
     form_anular("dev", q("""SELECT dv.id, 'N°' || dv.id || ' · ' || dv.fecha || ' · ' || dv.cliente || ' · ' ||
                                    p.nombre || ' · ' || dv.cantidad AS etiqueta
                             FROM devoluciones dv JOIN productos p ON p.id = dv.producto_id
-                            WHERE dv.anulado = 0 ORDER BY dv.id DESC LIMIT 100"""), anular_devolucion)
+                            ORDER BY dv.id DESC LIMIT 100"""), anular_devolucion)
     st.dataframe(q("""SELECT dv.id AS n, dv.fecha, dv.cliente, p.codigo AS codigo_prod, p.nombre AS producto,
-                      ped.lote AS lote_despachado,
-                      dv.cantidad, dv.motivo, dv.destino AS destino_producto,
+                      ped.lote AS lote_devuelto,
                       op_prod.nombre AS operador_que_produjo,
+                      dv.cantidad, dv.motivo, dv.destino AS destino_producto,
                       op_rec.nombre AS responsable_recepcion,
                       dv.documento, dv.observacion
                       FROM devoluciones dv
@@ -1813,12 +1791,12 @@ def pag_almacen_pt():
         "producido": ("SELECT producto_id, SUM(cantidad) AS total FROM salida_planta "
                       "WHERE anulado=0 AND fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
         "despachado": ("SELECT producto_id, SUM(cant_despachada) AS total FROM pedidos "
-                       "WHERE anulado=0 AND fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
+                       "WHERE fecha BETWEEN ? AND ? GROUP BY producto_id", (d, h)),
         "devuelto_reingresado": ("SELECT producto_id, SUM(cantidad) AS total FROM devoluciones "
-                                 "WHERE anulado=0 AND destino=? AND fecha BETWEEN ? AND ? "
+                                 "WHERE destino=? AND fecha BETWEEN ? AND ? "
                                  "GROUP BY producto_id", (DESTINO_REINGRESO, d, h)),
         "devuelto_merma": ("SELECT producto_id, SUM(cantidad) AS total FROM devoluciones "
-                           "WHERE anulado=0 AND destino=? AND fecha BETWEEN ? AND ? "
+                           "WHERE destino=? AND fecha BETWEEN ? AND ? "
                            "GROUP BY producto_id", (DESTINO_MERMA, d, h)),
     }
     for col, (sql, params) in flujos.items():
@@ -1847,9 +1825,8 @@ def pag_almacen_pt():
 
 def pag_kardex():
     st.header("Kardex")
-    st.caption("El Kardex no se edita a mano: refleja todos los movimientos. Si hubo un error, anula el "
-               "registro de origen (recepción, producción, despacho o conteo) y aquí verás el "
-               "movimiento que lo corrige.")
+    st.caption("El Kardex no se edita a mano: refleja todos los movimientos. Si hubo un error, anula o "
+               "elimina el registro de origen y aquí verás el movimiento que lo corrige.")
     nombres = ["(Todos)"] + q("SELECT nombre FROM productos ORDER BY nombre").nombre.tolist()
     sel = st.selectbox("Producto", nombres)
     df = kardex(None if sel == "(Todos)" else sel)
@@ -1914,13 +1891,13 @@ def pag_indicadores():
 
 # ─────────────────────────── Resumen por semana / mes / año ───────────────────────────
 def _suma_por_unidad(tabla, campo, d, h):
+    cond = "t.anulado = 0 AND " if tabla == "recepcion_leche" else ""
     df = q(f"""SELECT p.unidad, SUM(t.{campo}) AS total FROM {tabla} t
                JOIN productos p ON p.id = t.producto_id
-               WHERE t.anulado = 0 AND t.fecha BETWEEN ? AND ? GROUP BY p.unidad""", (d, h))
+               WHERE {cond}t.fecha BETWEEN ? AND ? GROUP BY p.unidad""", (d, h))
     return {r.unidad: float(r.total) for r in df.itertuples()}
 
 def resumen_periodo(desde, hasta):
-    """Todas las cifras de un periodo (los registros anulados no cuentan)."""
     d, h = str(desde), str(hasta)
     ind = indicadores(desde, hasta)
     leche = q("SELECT COALESCE(SUM(litros), 0) AS v FROM recepcion_leche "
@@ -1960,7 +1937,7 @@ def fila_resumen(etiqueta, r):
 
 def tabla_resumen(filas):
     df = pd.DataFrame(filas)
-    for col in ("producción_L", "despachado_L", "devuelto_L"):  # se oculta si no hay productos en litros
+    for col in ("producción_L", "despachado_L", "devuelto_L"):
         if col in df and (df[col] == 0).all():
             df = df.drop(columns=col)
     return df
@@ -1968,7 +1945,6 @@ def tabla_resumen(filas):
 DIAS_SEMANA = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 
 def dias_del_mes(anio, mes):
-    """Un renglón por cada día del mes, porque la producción se registra día a día."""
     ultimo = monthrange(anio, mes)[1]
     out = []
     for d in range(1, ultimo + 1):
@@ -1977,14 +1953,15 @@ def dias_del_mes(anio, mes):
     return out
 
 def tabla_por_producto(d, h):
-    def serie(tabla, campo):
+    def serie(tabla, campo, anulado_filtro=True):
+        cond = "t.anulado = 0 AND " if anulado_filtro else ""
         return q(f"""SELECT p.nombre, SUM(t.{campo}) AS total FROM {tabla} t
                      JOIN productos p ON p.id = t.producto_id
-                     WHERE t.anulado = 0 AND t.fecha BETWEEN ? AND ? GROUP BY p.nombre""",
+                     WHERE {cond}t.fecha BETWEEN ? AND ? GROUP BY p.nombre""",
                  (d, h)).set_index("nombre")["total"]
     df = pd.concat({"producido": serie("salida_planta", "cantidad"),
-                    "despachado": serie("pedidos", "cant_despachada"),
-                    "devuelto": serie("devoluciones", "cantidad")}, axis=1).fillna(0.0)
+                    "despachado": serie("pedidos", "cant_despachada", anulado_filtro=False),
+                    "devuelto": serie("devoluciones", "cantidad", anulado_filtro=False)}, axis=1).fillna(0.0)
     df.index.name = "producto"
     return df.reset_index()
 
@@ -2031,9 +2008,9 @@ def pag_resumen():
     anios = list(range(hoy.year, min(anio_ini, hoy.year) - 1, -1))
     anio = st.selectbox("Año", anios, key="res_anio")
     if "res_sel" not in st.session_state:
-        st.session_state["res_sel"] = hoy.month      # 1..12 = mes, 0 = año completo
+        st.session_state["res_sel"] = hoy.month
     sel = st.session_state["res_sel"]
-    for fila in range(3):                             # 12 meses en una cuadrícula de 4 x 3
+    for fila in range(3):
         cols = st.columns(4)
         for j, col in enumerate(cols):
             m = fila * 4 + j + 1
@@ -2074,170 +2051,6 @@ def pag_resumen():
     st.caption("Los registros anulados no se cuentan. Fill rate, recuperación, merma y exactitud se "
                "calculan con los registros de cada periodo; las semanas van de lunes a domingo.")
 
-MARCA_DEMO = "demo_cargada"
-
-def _pid_demo(codigo):
-    con = get_conn()
-    pid = producto_id(con, codigo)
-    con.close()
-    return pid
-
-def datos_ejemplo_ya_cargados():
-    con = get_conn()
-    cargada = get_meta(con, MARCA_DEMO) is not None
-    con.close()
-    return cargada
-
-def borrar_datos_ejemplo():
-    con = get_conn()
-    for tabla in ("movimientos", "produccion_insumos", "trazabilidad", "devoluciones", "pedidos",
-                  "produccion", "recepcion_leche", "pasteurizacion", "conteos", "programacion"):
-        con.execute(f"DELETE FROM {tabla}")
-    con.execute("DELETE FROM meta WHERE clave = ?", (MARCA_DEMO,))
-    con.commit()
-    con.close()
-
-def cargar_datos_ejemplo():
-    """Carga ~15 días de movimientos INVENTADOS (recepción, producción, despachos, etc.),
-    usando el catálogo real (proveedores, operadores, tiendas, productos) ya sembrado."""
-    if datos_ejemplo_ya_cargados():
-        raise ValueError("Los datos de ejemplo ya estaban cargados; no se repite la carga. "
-                         "Si quieres recargarlos, primero bórralos.")
-    con = get_conn()
-    proveedores = [r[0] for r in con.execute(
-        "SELECT id FROM proveedores WHERE nombre IN ('Huacariz','Valle Verde','San José','Hierba Buena') "
-        "ORDER BY id")]
-    operadores = [r[0] for r in con.execute(
-        "SELECT id FROM operadores WHERE nombre IN "
-        "('Saúl Castrejón','Luis Huaripata','Freddy Cholán','Ana Torres',"
-        "'Margarita Culqui','Caroline Ruíz','Walter Prado','Guillermo Mantilla') ORDER BY id")]
-    destinos = [r[0] for r in con.execute("SELECT id FROM destinos ORDER BY id")]
-    con.close()
-    if len(proveedores) < 4 or len(operadores) < 8 or not destinos:
-        raise ValueError("Falta el catálogo real (proveedores, operadores o tiendas). "
-                         "Asegúrate de tener la última versión del sistema.")
-
-    prov_huacariz, prov_valle, prov_sanjose, prov_hierba = proveedores
-    op_jorge = operadores[-1]
-    productos_demo = ["PT-MOZ", "PT-EDAM", "PT-ANDINO", "PT-YOGFRUT", "PT-MANTEQ", "PT-MIEL", "PT-CREMA"]
-    insumos_ejemplo = [
-        {"insumo": "Cuajo", "cantidad_g": 5, "marca": "Chr Hansen (ejemplo)", "lote": "L-77",
-         "fecha_prod": "01/26", "fecha_venc": "01/27"},
-        {"insumo": "Cultivo", "cantidad_g": 2, "marca": "Danisco (ejemplo)", "lote": "C-12",
-         "fecha_prod": "02/26", "fecha_venc": "02/27"},
-    ]
-    inicio = date.today() - timedelta(days=21)
-    lotes_creados, despachos_creados = [], []
-    f = inicio
-    dia_n = 0
-    while dia_n < 15:
-        if f.weekday() == 6:
-            f += timedelta(days=1)
-            continue
-        dia_n += 1
-        proveedor = [prov_huacariz, prov_valle, prov_sanjose, prov_hierba][dia_n % 4]
-        litros_recibidos = 500 + (dia_n % 5) * 40
-        operador_recepcion = operadores[dia_n % len(operadores)]
-        producto_dia = productos_demo[dia_n % len(productos_demo)]
-        lote = f"L{f.strftime('%m%d')}"
-
-        registrar_programacion(f, lote, _pid_demo(producto_dia), litros_recibidos - 50,
-                               operadores[dia_n % len(operadores)], "Programación de ejemplo")
-
-        mastitis = "Positivo" if dia_n == 7 else "Negativo"
-        registrar_recepcion(
-            f, proveedor, litros_recibidos, grasa=3.5 + (dia_n % 3) * 0.1, acidez=16 + dia_n % 4,
-            densidad=1.029, temp=9 + dia_n % 3, aprobada=True,
-            hora="06:30", n_tanques=1, n_porongos=4 + dia_n % 3, procedencia="Cajamarca",
-            ph=6.6 + (dia_n % 3) * 0.05, lactosa=4.6, proteina=3.1, sng=8.6,
-            mastitis=mastitis, antibioticos="Ausente", agua_l=10, responsable_id=operador_recepcion)
-        if dia_n == 10:
-            registrar_recepcion(f, prov_hierba, 80, grasa=3.0, acidez=28, densidad=1.025, temp=14,
-                                aprobada=False, antibioticos="Ausente", responsable_id=operador_recepcion)
-
-        temp_past = 60 if dia_n == 5 else 65
-        registrar_pasteurizacion(f, lote, litros_recibidos - 50, temp_past, 30, "07:00",
-                                 operadores[dia_n % len(operadores)], producto_id_=_pid_demo(producto_dia))
-
-        obtenida = round((litros_recibidos - 50) * 0.10, 1)
-        suero = round((litros_recibidos - 50) * 0.84, 0)
-        vendido, usado = round(suero * 0.8), round(suero * 0.15)
-        operador_prod = operadores[(dia_n + 1) % len(operadores)]
-        registrar_produccion(f, lote, _pid_demo(producto_dia), litros_recibidos - 50,
-                             suero, vendido, usado, operador_prod,
-                             insumos=insumos_ejemplo if dia_n % 3 == 0 else None)
-        lotes_creados.append(lote)
-        # La salida de planta (pesaje real) — en la demo la registramos el mismo día, por simplicidad
-        registrar_salida_planta(f, lote, _pid_demo(producto_dia), obtenida,
-                                unidades=int(obtenida * 4), n_jabas=max(1, int(obtenida // 10)))
-
-        if dia_n % 2 == 0:
-            destino = destinos[dia_n % len(destinos)]
-            pedida = max(obtenida - 2, 1)
-            registrar_despacho(f, "", _pid_demo(producto_dia), pedida, pedida, f"G-{dia_n:03d}",
-                               destino_id=destino, responsable_id=op_jorge, lote=lote)
-            con = get_conn()
-            desp_id = con.execute("SELECT id FROM pedidos ORDER BY id DESC LIMIT 1").fetchone()[0]
-            con.close()
-            despachos_creados.append((desp_id, _pid_demo(producto_dia)))
-
-        f += timedelta(days=1)
-
-    for i, lote in enumerate(lotes_creados[:10]):
-        con = get_conn()
-        row = con.execute("SELECT id, fecha_produccion FROM trazabilidad WHERE lote=?", (lote,)).fetchone()
-        con.close()
-        if not row:
-            continue
-        traz_id, f_prod = row
-        f_prod = date.fromisoformat(f_prod)
-        destino_tienda = destinos[i % len(destinos)]
-        actualizar_trazabilidad(
-            traz_id, fecha_empaque=f_prod + timedelta(days=1), fecha_envasado=f_prod + timedelta(days=1),
-            fecha_maduracion=f_prod + timedelta(days=2) if i % 2 == 0 else None,
-            fecha_salida=f_prod + timedelta(days=3), destino_id=destino_tienda, destino_final_id=destino_tienda,
-            observacion="Trazabilidad de ejemplo")
-
-    if len(despachos_creados) >= 2:
-        d1, p1 = despachos_creados[0]
-        registrar_devolucion(inicio + timedelta(days=4), "", p1, 1, "Producto en mal estado",
-                             DESTINO_REINGRESO, despacho_id=d1, documento="DEV-001", responsable_id=op_jorge)
-        d2, p2 = despachos_creados[1]
-        registrar_devolucion(inicio + timedelta(days=8), "", p2, 1, "Producto vencido",
-                             DESTINO_MERMA, despacho_id=d2, documento="DEV-002", responsable_id=op_jorge)
-
-    stock = stock_actual()
-    moz = stock[stock.codigo == "PT-MOZ"]
-    if not moz.empty and moz.stock.iloc[0] > 0:
-        registrar_conteo(inicio + timedelta(days=14), _pid_demo("PT-MOZ"),
-                         round(moz.stock.iloc[0] * 0.95, 1), ajustar=True)
-
-    con = get_conn()
-    set_meta(con, MARCA_DEMO, "1")
-    con.commit()
-    con.close()
-
-
-def pag_datos_ejemplo():
-    st.header("Datos de ejemplo (demo)")
-    st.caption("Carga ~15 días de movimientos INVENTADOS (recepción, producción, despachos, etc.) usando "
-               "el catálogo real (proveedores, operadores, tiendas, productos), para mostrar el sistema "
-               "ya funcionando. Los nombres de proveedores y operadores sí son los reales; las cantidades "
-               "y fechas de los movimientos son inventadas.")
-    if datos_ejemplo_ya_cargados():
-        st.info("Los datos de ejemplo ya están cargados.")
-        if st.button("Borrar datos de ejemplo"):
-            borrar_datos_ejemplo()
-            st.success("Datos de ejemplo borrados. Recarga la página para verlo vacío.")
-    else:
-        if st.button("Cargar datos de ejemplo"):
-            try:
-                cargar_datos_ejemplo()
-                st.success("Listo. Se cargaron 15 días de datos de ejemplo. Ve al Panel o al Resumen para verlos.")
-            except ValueError as ex:
-                st.error(str(ex))
-
-
 PAGINAS = {
     "Panel": pag_dashboard,
     "Resumen": pag_resumen,
@@ -2256,7 +2069,6 @@ PAGINAS = {
     "Kardex": pag_kardex,
     "Inventario físico": pag_conteo,
     "Indicadores": pag_indicadores,
-    "Datos de ejemplo (demo)": pag_datos_ejemplo,
 }
 
 def main():
