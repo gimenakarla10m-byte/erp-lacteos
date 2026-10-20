@@ -1006,22 +1006,24 @@ def guardar(fn, *args, ok="Registrado correctamente."):
 def cargar_demo_1_15_octubre():
     con = get_conn()
     try:
+        # Verificar si ya existen registros para octubre de 2026
         cnt = con.execute("SELECT COUNT(*) FROM recepcion_leche WHERE fecha LIKE '2026-10-%'").fetchone()[0]
         if cnt > 0:
             st.warning("Ya existen registros para octubre de 2026 en la base de datos.")
             return
 
+        # Cargar registros de recepción de leche (1 al 15 de octubre) con columnas estrictamente básicas
         dias_demo = [f"2026-10-{d:02d}" for d in range(1, 16)]
         
         for fecha in dias_demo:
             con.execute("""
-                INSERT INTO recepcion_leche (fecha, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, 'Ruta Norte - Cajamarca', 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
+                INSERT INTO recepcion_leche (fecha, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
             """, (fecha,))
 
             con.execute("""
-                INSERT INTO recepcion_leche (fecha, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, 'Ruta Sur - Llicanchancha', 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
+                INSERT INTO recepcion_leche (fecha, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
             """, (fecha,))
 
         con.commit()
