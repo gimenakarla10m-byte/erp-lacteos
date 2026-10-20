@@ -1006,39 +1006,28 @@ def guardar(fn, *args, ok="Registrado correctamente."):
 def cargar_demo_1_15_octubre():
     con = get_conn()
     try:
-        # Verificar si ya existen registros para octubre de 2026
-        cnt = con.execute("SELECT COUNT(*) FROM recepcion_leche WHERE fecha LIKE '2026-10-%'").fetchone()[0]
-        if cnt > 0:
-            st.warning("Ya existen registros para octubre de 2026 en la base de datos.")
-            return
-
-        # Consultar las columnas reales que existen en tu tabla recepcion_leche
+        # Borrar registros previos de octubre para evitar bloqueos y limpiar duplicados
+        con.execute("DELETE FROM recepcion_leche WHERE fecha LIKE '2026-10-%'")
+        
+        # Consultar las columnas reales de tu tabla
         cursor = con.execute("PRAGMA table_info(recepcion_leche)")
         columnas_tabla = [col[1] for col in cursor.fetchall()]
 
-        # Cargar registros de recepción de leche (1 al 15 de octubre) usando dinámicamente las columnas disponibles
         dias_demo = [f"2026-10-{d:02d}" for d in range(1, 16)]
         
         for fecha in dias_demo:
-            # Construir un diccionario dinámico según las columnas que tenga tu tabla
-            datos_insercion = {"fecha": fecha}
-            
-            # Asignar valores opcionales solo si la columna existe en tu base de datos
+            # Insertar adaptándose a la estructura real de tu tabla
             if "litros" in columnas_tabla:
-                datos_insercion["litros"] = 250.5
+                con.execute("INSERT INTO recepcion_leche (fecha, litros) VALUES (?, 250.5)", (fecha,))
             elif "cantidad" in columnas_tabla:
-                datos_insercion["cantidad"] = 250.5
+                con.execute("INSERT INTO recepcion_leche (fecha, cantidad) VALUES (?, 250.5)", (fecha,))
             elif "litros_recibidos" in columnas_tabla:
-                datos_insercion["litros_recibidos"] = 250.5
-
-            cols = ", ".join(datos_insercion.keys())
-            placeholders = ", ".join(["?"] * len(datos_insercion))
-            valores = tuple(datos_insercion.values())
-
-            con.execute(f"INSERT INTO recepcion_leche ({cols}) VALUES ({placeholders})", valores)
+                con.execute("INSERT INTO recepcion_leche (fecha, litros_recibidos) VALUES (?, 250.5)", (fecha,))
+            else:
+                con.execute("INSERT INTO recepcion_leche (fecha) VALUES (?)", (fecha,))
 
         con.commit()
-        st.success("¡Datos de demostración del 1 al 15 de octubre cargados exitosamente!")
+        st.success("¡Datos de demostración del 1 al 15 de octubre recargados con éxito!")
         st.rerun()
         
     except Exception as e:
