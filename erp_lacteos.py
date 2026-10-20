@@ -1003,6 +1003,46 @@ def guardar(fn, *args, ok="Registrado correctamente."):
         st.error(str(e))
         return False
 
+def cargar_demo_1_15_octubre():
+    con = get_conn()
+    try:
+        cnt = con.execute("SELECT COUNT(*) FROM recepcion_leche WHERE fecha LIKE '2026-10-%'").fetchone()[0]
+        if cnt > 0:
+            st.warning("Ya existen registros para octubre de 2026 en la base de datos.")
+            return
+
+        provs = {r[0]: r[1] for r in con.execute("SELECT nombre, id FROM proveedores").fetchall()}
+        ops = {r[0]: r[1] for r in con.execute("SELECT nombre, id FROM operadores").fetchall()}
+
+        if not provs or not ops:
+            st.error("Primero debes registrar al menos un proveedor y un operador en el sistema antes de cargar el demo.")
+            return
+
+        p_default = list(provs.values())[0]
+        o_default = list(ops.values())[0]
+
+        dias_demo = [f"2026-10-{d:02d}" for d in range(1, 16)]
+        
+        for fecha in dias_demo:
+            con.execute("""
+                INSERT INTO recepcion_leche (fecha, turno, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, 'Mañana', ?, ?, 'Ruta Norte - Cajamarca', 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
+            """, (fecha, p_default, o_default))
+
+            con.execute("""
+                INSERT INTO recepcion_leche (fecha, turno, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, 'Tarde', ?, ?, 'Ruta Sur - Llicanchancha', 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
+            """, (fecha, p_default, o_default))
+
+        con.commit()
+        st.success("¡Datos de demostración del 1 al 15 de octubre cargados exitosamente!")
+        
+    except Exception as e:
+        st.error(f"Error al cargar el demo: {str(e)}")
+    finally:
+        con.close()
+        return
+      
 def pag_dashboard():
     st.header("Panel de inventario")
     df = stock_actual()
@@ -2168,6 +2208,13 @@ def main():
     st.set_page_config(page_title="ERP Lácteos", page_icon="🧀", layout="wide")
     init_db()
     st.sidebar.title("🧀 ERP Lácteos")
+  
+    st.sidebar.divider()
+    with st.sidebar.expander("⚙️ Opciones de Demostración"):
+      if st.butoon("📥 Cargar demo (1-15 Octubre)"):
+          cargar_demo_1_15_octubre()
+    st.sideber.divider()
+  
     PAGINAS[st.sidebar.radio("Módulo", list(PAGINAS))]()
 
 if __name__ == "__main__":
