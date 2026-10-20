@@ -1002,9 +1002,7 @@ def guardar(fn, *args, ok="Registrado correctamente."):
     except (ValueError, sqlite3.Error) as e:
         st.error(str(e))
         return False
-      # ==========================================
-# FUNCIÓN DE DEMOSTRACIÓN (1 al 15 de Octubre)
-# ==========================================
+
 def cargar_demo_1_15_octubre():
     con = get_conn()
     try:
