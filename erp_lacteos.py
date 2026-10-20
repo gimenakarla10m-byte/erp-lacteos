@@ -2323,12 +2323,11 @@ def main():
     st.set_page_config(page_title="ERP Lácteos", page_icon="🧀", layout="wide")
     init_db()
     st.sidebar.title("🧀 ERP Lácteos")
-    
-   st.sidebar.divider()
+    st.sidebar.divider()
     with st.sidebar.expander("⚙️ Opciones de Demostración"):
         if st.button("📥 Cargar demo (1-15 Octubre)"):
             cargar_demo_1_15_octubre()
             st.rerun()
-    st.sidebar.divider()  # <-- Alineado al inicio (sin sangría
+    st.sidebar.divider()
 
     PAGINAS[st.sidebar.radio("Módulo", list(PAGINAS))]()
