@@ -2211,7 +2211,7 @@ def main():
   
     st.sidebar.divider()
     with st.sidebar.expander("⚙️ Opciones de Demostración"):
-      if st.butoon("📥 Cargar demo (1-15 Octubre)"):
+      if st.button("📥 Cargar demo (1-15 Octubre)"):
           cargar_demo_1_15_octubre()
     st.sideber.divider()
   
