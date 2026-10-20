@@ -1025,13 +1025,13 @@ def cargar_demo_1_15_octubre():
         
         for fecha in dias_demo:
             con.execute("""
-                INSERT INTO recepcion_leche (fecha, turno, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, 'Mañana', ?, ?, 'Ruta Norte - Cajamarca', 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
+                INSERT INTO recepcion_leche (fecha, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, ?, ?, 'Ruta Norte - Cajamarca', 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
             """, (fecha, p_default, o_default))
 
             con.execute("""
-                INSERT INTO recepcion_leche (fecha, turno, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, 'Tarde', ?, ?, 'Ruta Sur - Llicanchancha', 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
+                INSERT INTO recepcion_leche (fecha, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, ?, ?, 'Ruta Sur - Llicanchancha', 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
             """, (fecha, p_default, o_default))
 
         con.commit()
@@ -1041,7 +1041,6 @@ def cargar_demo_1_15_octubre():
         st.error(f"Error al cargar el demo: {str(e)}")
     finally:
         con.close()
-        return
       
 def pag_dashboard():
     st.header("Panel de inventario")
