@@ -1011,31 +1011,22 @@ def cargar_demo_1_15_octubre():
             st.warning("Ya existen registros para octubre de 2026 en la base de datos.")
             return
 
-        provs = {r[0]: r[1] for r in con.execute("SELECT nombre, id FROM proveedores").fetchall()}
-        ops = {r[0]: r[1] for r in con.execute("SELECT nombre, id FROM operadores").fetchall()}
-
-        if not provs or not ops:
-            st.error("Primero debes registrar al menos un proveedor y un operador en el sistema antes de cargar el demo.")
-            return
-
-        p_default = list(provs.values())[0]
-        o_default = list(ops.values())[0]
-
         dias_demo = [f"2026-10-{d:02d}" for d in range(1, 16)]
         
         for fecha in dias_demo:
             con.execute("""
-                INSERT INTO recepcion_leche (fecha, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, ?, ?, 'Ruta Norte - Cajamarca', 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
-            """, (fecha, p_default, o_default))
+                INSERT INTO recepcion_leche (fecha, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, 'Ruta Norte - Cajamarca', 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
+            """, (fecha,))
 
             con.execute("""
-                INSERT INTO recepcion_leche (fecha, proveedor_id, operador_id, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, ?, ?, 'Ruta Sur - Llicanchancha', 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
-            """, (fecha, p_default, o_default))
+                INSERT INTO recepcion_leche (fecha, ruta, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
+                VALUES (?, 'Ruta Sur - Llicanchancha', 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
+            """, (fecha,))
 
         con.commit()
         st.success("¡Datos de demostración del 1 al 15 de octubre cargados exitosamente!")
+        st.rerun()
         
     except Exception as e:
         st.error(f"Error al cargar el demo: {str(e)}")
