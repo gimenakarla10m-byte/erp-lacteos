@@ -1003,168 +1003,6 @@ def guardar(fn, *args, ok="Registrado correctamente."):
         st.error(str(e))
         return False
 
-def cargar_demo_1_15_octubre():
-    con = get_conn()
-    try:
-        cnt = con.execute("SELECT COUNT(*) FROM recepcion_leche WHERE fecha LIKE '2026-10-%'").fetchone()[0]
-        if cnt > 0:
-            st.warning("Ya existen registros para octubre de 2026 en la base de datos.")
-            return
-
-        provs = {r[0]: r[1] for r in con.execute("SELECT nombre, id FROM proveedores").fetchall()}
-        ops = {r[0]: r[1] for r in con.execute("SELECT nombre, id FROM operadores").fetchall()}
-        prods = {r[0]: r[1] for r in con.execute("SELECT codigo, id FROM productos").fetchall()}
-        dests = {r[0]: r[1] for r in con.execute("SELECT nombre, id FROM destinos").fetchall()}
-
-        recepciones_demo = [
-            ("2026-10-01", provs.get("Huacariz"), 350.0, 3.8, 16.5, 1.032, 17.0, 1, "06:30", 1, 14, "Ruta Huacariz", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 350.0, ops.get("Saúl Castrejón")),
-            ("2026-10-01", provs.get("Valle Verde"), 280.0, 3.6, 17.0, 1.031, 19.0, 1, "07:00", 1, 11, "Ruta Valle Verde", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 280.0, ops.get("Saúl Castrejón")),
-            ("2026-10-02", provs.get("San José"), 310.0, 3.7, 18.0, 1.030, 18.5, 1, "06:45", 1, 12, "Ruta San José", 6.4, 4.3, 3.0, 8.3, "Negativo", "Ausente", 5.0, 305.0, ops.get("Luis Huaripata")),
-            ("2026-10-02", provs.get("Hierba Buena"), 290.0, 3.9, 16.8, 1.032, 17.5, 1, "07:15", 1, 12, "Ruta Hierba Buena", 6.6, 4.6, 3.3, 8.6, "Negativo", "Ausente", 0.0, 290.0, ops.get("Luis Huaripata")),
-            ("2026-10-03", provs.get("Huacariz"), 340.0, 3.8, 17.2, 1.031, 18.0, 1, "06:30", 1, 14, "Ruta Huacariz", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 340.0, ops.get("Saúl Castrejón")),
-            ("2026-10-03", provs.get("Valle Verde"), 275.0, 3.5, 19.5, 1.029, 20.0, 1, "07:05", 1, 11, "Ruta Valle Verde", 6.3, 4.2, 3.0, 8.2, "Negativo", "Ausente", 0.0, 275.0, ops.get("Saúl Castrejón")),
-            ("2026-10-04", provs.get("San José"), 300.0, 3.7, 16.5, 1.032, 17.0, 1, "06:50", 1, 12, "Ruta San José", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 300.0, ops.get("Freddy Cholán")),
-            ("2026-10-04", provs.get("Hierba Buena"), 150.0, 3.2, 21.0, 1.027, 22.0, 0, "07:30", 1, 6, "Ruta Hierba Buena", 6.1, 3.9, 2.7, 7.9, "Negativo", "Presente", 0.0, 0.0, ops.get("Freddy Cholán")),
-            ("2026-10-05", provs.get("Huacariz"), 360.0, 3.9, 16.8, 1.032, 17.2, 1, "06:30", 1, 15, "Ruta Huacariz", 6.6, 4.6, 3.3, 8.6, "Negativo", "Ausente", 0.0, 360.0, ops.get("Saúl Castrejón")),
-            ("2026-10-05", provs.get("Valle Verde"), 290.0, 3.6, 17.0, 1.031, 18.0, 1, "07:00", 1, 12, "Ruta Valle Verde", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 290.0, ops.get("Saúl Castrejón")),
-            ("2026-10-06", provs.get("San José"), 320.0, 3.8, 16.7, 1.032, 17.5, 1, "06:40", 1, 13, "Ruta San José", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 320.0, ops.get("Luis Huaripata")),
-            ("2026-10-06", provs.get("Hierba Buena"), 310.0, 3.7, 17.5, 1.030, 18.5, 1, "07:20", 1, 12, "Ruta Hierba Buena", 6.4, 4.3, 3.0, 8.3, "Negativo", "Ausente", 0.0, 310.0, ops.get("Luis Huaripata")),
-            ("2026-10-07", provs.get("Huacariz"), 350.0, 3.8, 16.5, 1.032, 17.0, 1, "06:30", 1, 14, "Ruta Huacariz", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 350.0, ops.get("Saúl Castrejón")),
-            ("2026-10-07", provs.get("Valle Verde"), 280.0, 3.6, 17.0, 1.031, 19.0, 1, "07:00", 1, 11, "Ruta Valle Verde", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 280.0, ops.get("Saúl Castrejón")),
-            ("2026-10-08", provs.get("San José"), 310.0, 3.7, 18.0, 1.030, 18.5, 1, "06:45", 1, 12, "Ruta San José", 6.4, 4.3, 3.0, 8.3, "Negativo", "Ausente", 0.0, 310.0, ops.get("Freddy Cholán")),
-            ("2026-10-08", provs.get("Hierba Buena"), 295.0, 3.9, 16.8, 1.032, 17.5, 1, "07:15", 1, 12, "Ruta Hierba Buena", 6.6, 4.6, 3.3, 8.6, "Negativo", "Ausente", 0.0, 295.0, ops.get("Freddy Cholán")),
-            ("2026-10-09", provs.get("Huacariz"), 340.0, 3.8, 17.2, 1.031, 18.0, 1, "06:30", 1, 14, "Ruta Huacariz", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 340.0, ops.get("Saúl Castrejón")),
-            ("2026-10-09", provs.get("Valle Verde"), 270.0, 3.5, 19.0, 1.029, 19.5, 1, "07:05", 1, 11, "Ruta Valle Verde", 6.3, 4.2, 3.0, 8.2, "Negativo", "Ausente", 0.0, 270.0, ops.get("Saúl Castrejón")),
-            ("2026-10-10", provs.get("San José"), 305.0, 3.7, 16.5, 1.032, 17.0, 1, "06:50", 1, 12, "Ruta San José", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 305.0, ops.get("Luis Huaripata")),
-            ("2026-10-10", provs.get("Hierba Buena"), 285.0, 3.8, 17.0, 1.031, 18.0, 1, "07:25", 1, 11, "Ruta Hierba Buena", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 285.0, ops.get("Luis Huaripata")),
-            ("2026-10-11", provs.get("Huacariz"), 355.0, 3.9, 16.6, 1.032, 17.1, 1, "06:30", 1, 15, "Ruta Huacariz", 6.6, 4.6, 3.3, 8.6, "Negativo", "Ausente", 0.0, 355.0, ops.get("Saúl Castrejón")),
-            ("2026-10-11", provs.get("Valle Verde"), 285.0, 3.6, 17.2, 1.031, 18.2, 1, "07:00", 1, 11, "Ruta Valle Verde", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 285.0, ops.get("Saúl Castrejón")),
-            ("2026-10-12", provs.get("San José"), 315.0, 3.7, 16.8, 1.032, 17.4, 1, "06:40", 1, 13, "Ruta San José", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 315.0, ops.get("Freddy Cholán")),
-            ("2026-10-12", provs.get("Hierba Buena"), 290.0, 3.8, 16.9, 1.031, 17.8, 1, "07:20", 1, 12, "Ruta Hierba Buena", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 290.0, ops.get("Freddy Cholán")),
-            ("2026-10-13", provs.get("Huacariz"), 345.0, 3.8, 16.5, 1.032, 17.0, 1, "06:30", 1, 14, "Ruta Huacariz", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 345.0, ops.get("Saúl Castrejón")),
-            ("2026-10-13", provs.get("Valle Verde"), 280.0, 3.6, 17.0, 1.031, 18.0, 1, "07:00", 1, 11, "Ruta Valle Verde", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 280.0, ops.get("Saúl Castrejón")),
-            ("2026-10-14", provs.get("San José"), 310.0, 3.7, 16.7, 1.032, 17.3, 1, "06:45", 1, 12, "Ruta San José", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 310.0, ops.get("Luis Huaripata")),
-            ("2026-10-14", provs.get("Hierba Buena"), 295.0, 3.9, 16.8, 1.032, 17.5, 1, "07:15", 1, 12, "Ruta Hierba Buena", 6.6, 4.6, 3.3, 8.6, "Negativo", "Ausente", 0.0, 295.0, ops.get("Luis Huaripata")),
-            ("2026-10-15", provs.get("Huacariz"), 350.0, 3.8, 16.5, 1.032, 17.0, 1, "06:30", 1, 14, "Ruta Huacariz", 6.6, 4.5, 3.2, 8.5, "Negativo", "Ausente", 0.0, 350.0, ops.get("Saúl Castrejón")),
-            ("2026-10-15", provs.get("Valle Verde"), 285.0, 3.6, 17.0, 1.031, 18.0, 1, "07:00", 1, 11, "Ruta Valle Verde", 6.5, 4.4, 3.1, 8.4, "Negativo", "Ausente", 0.0, 285.0, ops.get("Saúl Castrejón")),
-        ]
-
-        for r in recepciones_demo:
-            con.execute("INSERT INTO recepcion_leche (fecha, proveedor_id, litros, grasa, acidez, densidad, temperatura, aprobada, hora, n_tanques, n_porongos, procedencia, ph, lactosa, proteina, sng, mastitis, antibioticos, agua_l, litros_aceptados, responsable_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r)
-            rec_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-            if r[7] == 1:
-                con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'ENTRADA', 'Recepción de leche', ?, ?, ?)", (r[0], prods.get("MP-LECHE"), r[19], f"REC-{rec_id}", f"Recepción de leche"))
-
-        pasteurizaciones_demo = [
-            ("2026-10-01", "PAST-01", 300.0, 65.0, 32.0, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-QFRESCO")),
-            ("2026-10-02", "PAST-02", 300.0, 64.5, 31.0, "08:15", ops.get("Luis Huaripata"), 1, "Conforme", prods.get("PT-MANT")),
-            ("2026-10-03", "PAST-03", 310.0, 65.0, 30.5, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-MOZ")),
-            ("2026-10-04", "PAST-04", 280.0, 65.2, 32.0, "08:10", ops.get("Freddy Cholán"), 1, "Conforme", prods.get("PT-QFRESCO")),
-            ("2026-10-05", "PAST-05", 350.0, 64.8, 31.5, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-MANJAR")),
-            ("2026-10-06", "PAST-06", 300.0, 65.0, 30.0, "08:15", ops.get("Luis Huaripata"), 1, "Conforme", prods.get("PT-MANT")),
-            ("2026-10-07", "PAST-07", 320.0, 65.5, 32.0, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-QFRESCO")),
-            ("2026-10-08", "PAST-08", 300.0, 65.0, 31.0, "08:10", ops.get("Freddy Cholán"), 1, "Conforme", prods.get("PT-NATILLA")),
-            ("2026-10-09", "PAST-09", 310.0, 64.5, 30.5, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-MOZ")),
-            ("2026-10-10", "PAST-10", 290.0, 65.0, 32.0, "08:15", ops.get("Luis Huaripata"), 1, "Conforme", prods.get("PT-EDAM")),
-            ("2026-10-11", "PAST-11", 330.0, 65.2, 31.5, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-QFRESCO")),
-            ("2026-10-12", "PAST-12", 300.0, 64.8, 30.0, "08:10", ops.get("Freddy Cholán"), 1, "Conforme", prods.get("PT-MANT")),
-            ("2026-10-13", "PAST-13", 310.0, 65.0, 32.0, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-MANJAR")),
-            ("2026-10-14", "PAST-14", 300.0, 65.5, 31.0, "08:15", ops.get("Luis Huaripata"), 1, "Conforme", prods.get("PT-NATILLA")),
-            ("2026-10-15", "PAST-15", 320.0, 65.0, 32.5, "08:00", ops.get("Saúl Castrejón"), 1, "Conforme", prods.get("PT-QFRESCO")),
-        ]
-        for p in pasteurizaciones_demo:
-            con.execute("INSERT INTO pasteurizacion (fecha, lote, litros, temperatura, tiempo_min, hora_inicio, operador_id, conforme, observacion, producto_id) VALUES (?,?,?,?,?,?,?,?,?,?)", p)
-
-        producciones_demo = [
-            ("2026-10-01", "L-QF-01", "PT-QFRESCO", 250.0, 200.0, 150.0, 30.0, ops.get("Saúl Castrejón"), 32.5, 65, 3, "2026-10-02", "2026-10-03", "2026-10-03", "2026-10-03", "2026-10-03", dests.get("Capuli"), dests.get("Capuli")),
-            ("2026-10-02", "L-MA-01", "PT-MANT", 250.0, 210.0, 160.0, 40.0, ops.get("Luis Huaripata"), 30.0, 60, 3, "2026-10-03", "2026-10-04", "2026-10-04", "2026-10-05", "2026-10-06", dests.get("San Martín"), dests.get("San Martín")),
-            ("2026-10-03", "L-MO-01", "PT-MOZ", 260.0, 220.0, 170.0, 40.0, ops.get("Saúl Castrejón"), 28.0, 56, 3, "2026-10-04", "2026-10-05", "2026-10-05", "2026-10-06", "2026-10-07", dests.get("La Fontina"), dests.get("La Fontina")),
-            ("2026-10-04", "L-QF-02", "PT-QFRESCO", 240.0, 190.0, 140.0, 30.0, ops.get("Freddy Cholán"), 31.0, 62, 3, "2026-10-05", "2026-10-06", "2026-10-06", "2026-10-06", "2026-10-06", dests.get("La Vaca"), dests.get("La Vaca")),
-            ("2026-10-05", "L-MANJ-01", "PT-MANJAR", 300.0, 0.0, 0.0, 0.0, ops.get("Saúl Castrejón"), 75.0, 150, 5, None, "2026-10-06", "2026-10-06", None, "2026-10-06", dests.get("Tienda principal"), dests.get("Tienda principal")),
-            ("2026-10-06", "L-MA-02", "PT-MANT", 260.0, 215.0, 160.0, 40.0, ops.get("Luis Huaripata"), 31.5, 63, 3, "2026-10-07", "2026-10-08", "2026-10-08", "2026-10-09", "2026-10-10", dests.get("Capuli"), dests.get("Capuli")),
-            ("2026-10-07", "L-QF-03", "PT-QFRESCO", 270.0, 215.0, 160.0, 40.0, ops.get("Saúl Castrejón"), 35.0, 70, 3, "2026-10-08", "2026-10-09", "2026-10-09", "2026-10-09", "2026-10-09", dests.get("San Martín"), dests.get("San Martín")),
-            ("2026-10-08", "L-NAT-01", "PT-NATILLA", 250.0, 0.0, 0.0, 0.0, ops.get("Freddy Cholán"), 60.0, 120, 4, None, "2026-10-09", "2026-10-09", None, "2026-10-09", dests.get("Baños del Inca"), dests.get("Baños del Inca")),
-            ("2026-10-09", "L-MO-02", "PT-MOZ", 260.0, 210.0, 150.0, 40.0, ops.get("Saúl Castrejón"), 29.0, 58, 3, "2026-10-10", "2026-10-11", "2026-10-11", "2026-10-12", "2026-10-13", dests.get("Aeropuerto"), dests.get("Aeropuerto")),
-            ("2026-10-10", "L-ED-01", "PT-EDAM", 240.0, 195.0, 140.0, 35.0, ops.get("Luis Huaripata"), 25.0, 50, 2, "2026-10-11", "2026-10-12", "2026-10-12", "2026-10-14", "2026-10-15", dests.get("La Fontina"), dests.get("La Fontina")),
-            ("2026-10-11", "L-QF-04", "PT-QFRESCO", 280.0, 225.0, 170.0, 40.0, ops.get("Saúl Castrejón"), 36.0, 72, 3, "2026-10-12", "2026-10-13", "2026-10-13", "2026-10-13", "2026-10-13", dests.get("Tienda principal"), dests.get("Tienda principal")),
-            ("2026-10-12", "L-MA-03", "PT-MANT", 250.0, 205.0, 150.0, 40.0, ops.get("Freddy Cholán"), 30.5, 61, 3, "2026-10-13", "2026-10-14", "2026-10-14", "2026-10-15", "2026-10-15", dests.get("Capuli"), dests.get("Capuli")),
-            ("2026-10-13", "L-MANJ-02", "PT-MANJAR", 260.0, 0.0, 0.0, 0.0, ops.get("Saúl Castrejón"), 65.0, 130, 4, None, "2026-10-14", "2026-10-14", None, "2026-10-14", dests.get("San Martín"), dests.get("San Martín")),
-            ("2026-10-14", "L-NAT-02", "PT-NATILLA", 250.0, 0.0, 0.0, 0.0, ops.get("Luis Huaripata"), 60.0, 120, 4, None, "2026-10-15", "2026-10-15", None, "2026-10-15", dests.get("La Vaca"), dests.get("La Vaca")),
-            ("2026-10-15", "L-QF-05", "PT-QFRESCO", 290.0, 235.0, 180.0, 40.0, ops.get("Saúl Castrejón"), 37.5, 75, 3, "2026-10-16", "2026-10-17", "2026-10-17", "2026-10-17", "2026-10-17", dests.get("Baños del Inca"), dests.get("Baños del Inca")),
-        ]
-
-        leche_id = prods.get("MP-LECHE")
-        suero_id = prods.get("SB-SUERO")
-
-        for fecha, lote, cod_p, l_lech, s_obt, s_vend, s_us, op_id, cant_sal, uni_sal, jab_sal, f_mad, f_emp, f_env, f_mad_emp, f_sal, d_inic, d_fin in producciones_demo:
-            pid = prods.get(cod_p)
-            con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'SALIDA', 'Consumo en producción', ?, ?, ?)", (fecha, leche_id, l_lech, lote, f"Lote {lote}"))
-
-            if s_obt > 0:
-                con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'ENTRADA', 'Suero de producción', ?, ?, ?)", (fecha, suero_id, s_obt, lote, f"Lote {lote}"))
-                if s_vend > 0:
-                    con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'SALIDA', 'Venta de suero', ?, ?, ?)", (fecha, suero_id, s_vend, lote, f"Lote {lote}"))
-                if s_us > 0:
-                    con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'SALIDA', 'Uso interno de suero', ?, ?, ?)", (fecha, suero_id, s_us, lote, f"Lote {lote}"))
-                merma_suero = s_obt - s_vend - s_us
-                if merma_suero > 0:
-                    con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'SALIDA', 'Merma de suero', ?, ?, ?)", (fecha, suero_id, merma_suero, lote, f"Lote {lote}"))
-
-            con.execute("INSERT INTO produccion (fecha, lote, producto_id, litros_leche, cantidad_obtenida, suero_obtenido, suero_vendido, suero_usado, operador_id, merma_en_kardex) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 1)", (fecha, lote, pid, l_lech, s_obt, s_vend, s_us, op_id))
-            prod_row_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-            if f_sal <= "2026-10-15":
-                con.execute("INSERT INTO salida_planta (fecha, lote, producto_id, cantidad, unidades, n_jabas, documento, observacion) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (f_sal, lote, pid, cant_sal, uni_sal, jab_sal, f"GUIA-{lote}", "Queso envasado al vacío"))
-                con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'ENTRADA', 'Salida de planta', ?, ?, ?)", (f_sal, pid, cant_sal, lote, lote))
-
-            con.execute("INSERT INTO trazabilidad (produccion_id, lote, producto_id, responsable_id, fecha_produccion, fecha_maduracion, fecha_empaque, fecha_envasado, fecha_maduracion_empaque, fecha_salida, destino_id, destino_final_id, observacion) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (prod_row_id, lote, pid, op_id, fecha, f_mad, f_emp, f_env, f_mad_emp, f_sal if f_sal <= "2026-10-15" else None, d_inic, d_fin, "Proceso controlado"))
-
-        pedidos_demo = [
-            ("2026-10-03", dests.get("Capuli"), None, "PT-QFRESCO", 32.0, ops.get("Caroline Ruíz"), "Pedido Capuli", 32.0, "2026-10-03", "G-001"),
-            ("2026-10-06", dests.get("San Martín"), None, "PT-MANT", 30.0, ops.get("Caroline Ruíz"), "Pedido San Martín", 30.0, "2026-10-06", "G-002"),
-            ("2026-10-06", dests.get("Tienda principal"), None, "PT-MANJAR", 75.0, ops.get("Walter Prado"), "Stock principal", 75.0, "2026-10-06", "G-003"),
-            ("2026-10-07", dests.get("La Fontina"), None, "PT-MOZ", 28.0, ops.get("Caroline Ruíz"), "Pedido La Fontina", 28.0, "2026-10-07", "G-004"),
-            ("2026-10-08", dests.get("La Vaca"), None, "PT-QFRESCO", 31.0, ops.get("Walter Prado"), "Pedido La Vaca", 31.0, "2026-10-08", "G-005"),
-            ("2026-10-09", dests.get("Baños del Inca"), None, "PT-NATILLA", 60.0, ops.get("Caroline Ruíz"), "Baños del Inca", 60.0, "2026-10-09", "G-006"),
-            ("2026-10-09", dests.get("San Martín"), None, "PT-QFRESCO", 35.0, ops.get("Walter Prado"), "San Martín", 35.0, "2026-10-09", "G-007"),
-            ("2026-10-10", dests.get("Capuli"), None, "PT-MANT", 31.5, ops.get("Caroline Ruíz"), "Capuli", 31.5, "2026-10-10", "G-008"),
-            ("2026-10-13", dests.get("Aeropuerto"), None, "PT-MOZ", 29.0, ops.get("Walter Prado"), "Aeropuerto", 29.0, "2026-10-13", "G-009"),
-            ("2026-10-14", dests.get("San Martín"), None, "PT-MANJAR", 65.0, ops.get("Caroline Ruíz"), "San Martín", 65.0, "2026-10-14", "G-010"),
-            ("2026-10-15", dests.get("La Vaca"), None, "PT-NATILLA", 60.0, ops.get("Walter Prado"), "La Vaca", 60.0, "2026-10-15", "G-011"),
-            ("2026-10-15", dests.get("Capuli"), None, "PT-QFRESCO", 40.0, ops.get("Caroline Ruíz"), "Capuli parcial", 30.0, "2026-10-15", "G-012"),
-        ]
-
-        for fecha, dest_id, cliente, cod_p, cant_sol, resp_id, obs, cant_desp, f_desp, guia in pedidos_demo:
-            pid = prods.get(cod_p)
-            cli_nombre = con.execute("SELECT nombre FROM destinos WHERE id=?", (dest_id,)).fetchone()[0] if dest_id else cliente
-            con.execute("INSERT INTO pedidos_cliente (fecha, destino_id, cliente, producto_id, cantidad_solicitada, responsable_id, observacion) VALUES (?,?,?,?,?,?,?)", (fecha, dest_id, cliente, pid, cant_sol, resp_id, obs))
-            pc_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-            if cant_desp > 0:
-                con.execute("INSERT INTO pedidos (fecha, cliente, producto_id, cant_pedida, cant_despachada, documento, destino_id, responsable_envio_id, pedido_cliente_id) VALUES (?,?,?,?,?,?,?,?,?)", (f_desp, cli_nombre, pid, cant_sol, cant_desp, guia, dest_id, resp_id, pc_id))
-                con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'SALIDA', 'Despacho a cliente', ?, ?, ?)", (f_desp, pid, cant_desp, guia, cli_nombre))
-
-        devoluciones_demo = [
-            ("2026-10-08", dests.get("La Vaca"), None, "PT-QFRESCO", 2.0, "Empaque dañado", DESTINO_MERMA, ops.get("Margarita Culqui"), "DEV-01", "Sello abierto"),
-            ("2026-10-12", dests.get("Capuli"), None, "PT-MANT", 1.5, "Error en el pedido", DESTINO_REINGRESO, ops.get("Margarita Culqui"), "DEV-02", "Exceso de stock"),
-        ]
-        for fecha, dest_id, cliente, cod_p, cant, motivo, dest_prod, resp_id, guia, obs in devoluciones_demo:
-            pid = prods.get(cod_p)
-            cli_nombre = con.execute("SELECT nombre FROM destinos WHERE id=?", (dest_id,)).fetchone()[0] if dest_id else cliente
-            con.execute("INSERT INTO devoluciones (fecha, cliente, producto_id, cantidad, motivo, destino, documento, observacion, destino_id, responsable_id) VALUES (?,?,?,?,?,?,?,?,?,?)", (fecha, cli_nombre, pid, cant, motivo, dest_prod, guia, obs, dest_id, resp_id))
-            if dest_prod == DESTINO_REINGRESO:
-                con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES (?, ?, 'ENTRADA', 'Devolución de leche / producto', ?, ?, ?)", (fecha, pid, cant, guia, cli_nombre))
-
-        con.execute("INSERT INTO conteos (fecha, producto_id, stock_sistema, stock_fisico, diferencia, ajustado) VALUES ('2026-10-15', ?, 37.5, 37.0, -0.5, 1)", (prods.get("PT-QFRESCO"),))
-        con.execute("INSERT INTO movimientos (fecha, producto_id, tipo, motivo, cantidad, documento, observacion) VALUES ('2026-10-15', ?, 'SALIDA', 'Ajuste por inventario físico', 0.5, 'CONTEO-2026-10-15', 'Merma por frío')", (prods.get("PT-QFRESCO"),))
-
-        con.commit()
-        st.success("¡Datos de demostración del 1 al 15 de octubre cargados exitosamente!")
-    except Exception as e:
-        con.rollback()
-        st.error(f"Error al cargar el demo: {e}")
-    finally:
-        con.close()
 def pag_dashboard():
     st.header("Panel de inventario")
     df = stock_actual()
@@ -1407,7 +1245,7 @@ def bloque_destinos():
             opts = etiquetas(activos)
             with st.form("f_del_dest"):
                 sel_e = st.selectbox("Destino a eliminar", list(opts), format_func=opts.get)
-                ok_e = st.checkbox("Confirmo que quiero eliminarlo", key="ok_del_dest")
+                ok_e = st.checkbox("Confirmo que quiero eliminarlo", key="ok_baja_dest")
                 if st.form_submit_button("Eliminar destino"):
                     if not ok_e:
                         st.error("Marca la casilla de confirmación.")
@@ -1609,12 +1447,21 @@ def pag_produccion():
             {"insumo": "Azúcar", "label": "Azúcar (g)", "step": 1.0},
             {"insumo": "Cultivo", "label": "Cultivo (g)", "step": 1.0},
         ]
+    elif "queso" in p_lower:
+        insumos_config = [
+            {"insumo": "Cloruro de calcio", "label": "Cloruro de calcio (g)", "step": 1.0},
+            {"insumo": "Cultivo", "label": "Cultivo (g)", "step": 1.0},
+            {"insumo": "Conservante", "label": "Conservante (g)", "step": 1.0},
+            {"insumo": "Cuajo", "label": "Cuajo (g)", "step": 1.0},
+            {"insumo": "Cloruro de sodio", "label": "Cloruro de sodio (g)", "step": 10.0},
+        ]
     else:
         insumos_config = [
             {"insumo": "Cloruro de calcio", "label": "Cloruro de calcio (g)", "step": 1.0},
             {"insumo": "Cultivo", "label": "Cultivo (g)", "step": 1.0},
             {"insumo": "Conservante", "label": "Conservante (g)", "step": 1.0},
             {"insumo": "Cuajo", "label": "Cuajo (g)", "step": 1.0},
+            {"insumo": "Cloruro de sodio", "label": "Cloruro de sodio (g)", "step": 10.0},
         ]
 
     with st.form("f_prod_reg", clear_on_submit=True):
@@ -2321,11 +2168,7 @@ def main():
     st.set_page_config(page_title="ERP Lácteos", page_icon="🧀", layout="wide")
     init_db()
     st.sidebar.title("🧀 ERP Lácteos")
-    st.sidebar.divider()
-    with st.sidebar.expander("⚙️ Opciones de Demostración"):
-        if st.button("📥 Cargar demo (1-15 Octubre)"):
-            cargar_demo_1_15_octubre()
-            st.rerun()
-    st.sidebar.divider()
-
     PAGINAS[st.sidebar.radio("Módulo", list(PAGINAS))]()
+
+if __name__ == "__main__":
+    main()
