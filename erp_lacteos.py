@@ -2324,13 +2324,11 @@ def main():
     init_db()
     st.sidebar.title("🧀 ERP Lácteos")
     
-    # 📥 PEGA AQUÍ EL BLOQUE DEL DEMO EN LA BARRA LATERAL:
-    st.sidebar.divider()
+   st.sidebar.divider()
     with st.sidebar.expander("⚙️ Opciones de Demostración"):
         if st.button("📥 Cargar demo (1-15 Octubre)"):
             cargar_demo_1_15_octubre()
             st.rerun()
-    st.sidebar.divider()
-    # ----------------------------------------------------
+    st.sidebar.divider()  # <-- Alineado al inicio (sin sangría
 
     PAGINAS[st.sidebar.radio("Módulo", list(PAGINAS))]()
