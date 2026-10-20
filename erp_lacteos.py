@@ -2213,7 +2213,7 @@ def main():
     with st.sidebar.expander("⚙️ Opciones de Demostración"):
       if st.button("📥 Cargar demo (1-15 Octubre)"):
           cargar_demo_1_15_octubre()
-    st.sideber.divider()
+    st.sidebar.divider()
   
     PAGINAS[st.sidebar.radio("Módulo", list(PAGINAS))]()
 
