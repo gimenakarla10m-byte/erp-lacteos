@@ -1012,19 +1012,30 @@ def cargar_demo_1_15_octubre():
             st.warning("Ya existen registros para octubre de 2026 en la base de datos.")
             return
 
-        # Cargar registros de recepción de leche (1 al 15 de octubre) con columnas estrictamente básicas
+        # Consultar las columnas reales que existen en tu tabla recepcion_leche
+        cursor = con.execute("PRAGMA table_info(recepcion_leche)")
+        columnas_tabla = [col[1] for col in cursor.fetchall()]
+
+        # Cargar registros de recepción de leche (1 al 15 de octubre) usando dinámicamente las columnas disponibles
         dias_demo = [f"2026-10-{d:02d}" for d in range(1, 16)]
         
         for fecha in dias_demo:
-            con.execute("""
-                INSERT INTO recepcion_leche (fecha, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, 250.5, 4.2, 'Negativo', 1.032, 15.0, 'Conforme', 'Aprobado')
-            """, (fecha,))
+            # Construir un diccionario dinámico según las columnas que tenga tu tabla
+            datos_insercion = {"fecha": fecha}
+            
+            # Asignar valores opcionales solo si la columna existe en tu base de datos
+            if "litros" in columnas_tabla:
+                datos_insercion["litros"] = 250.5
+            elif "cantidad" in columnas_tabla:
+                datos_insercion["cantidad"] = 250.5
+            elif "litros_recibidos" in columnas_tabla:
+                datos_insercion["litros_recibidos"] = 250.5
 
-            con.execute("""
-                INSERT INTO recepcion_leche (fecha, litros_recibidos, temperatura, prueba_alcohol, densidad, acidez, calidad_observaciones, estado)
-                VALUES (?, 180.0, 4.5, 'Negativo', 1.031, 16.0, 'Conforme', 'Aprobado')
-            """, (fecha,))
+            cols = ", ".join(datos_insercion.keys())
+            placeholders = ", ".join(["?"] * len(datos_insercion))
+            valores = tuple(datos_insercion.values())
+
+            con.execute(f"INSERT INTO recepcion_leche ({cols}) VALUES ({placeholders})", valores)
 
         con.commit()
         st.success("¡Datos de demostración del 1 al 15 de octubre cargados exitosamente!")
